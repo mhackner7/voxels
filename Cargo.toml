@@ -1,0 +1,10 @@
+[package]
+name = "voxels"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastrand = "2.5.0"
+pixels = "0.17.2"
+rayon = "1.12.0"
+winit = "0.30.13"
