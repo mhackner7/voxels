@@ -6,21 +6,29 @@ use crate::simd::simdi32::SimdI32;
 use crate::simd::simdu32::SimdU32;
 use crate::world::voxel::*;
 
-pub struct TestGrid {
-    pub grid: [Material; 8 * 8 * 8],
-    pub bmin: Vec3,
-    pub bmax: Vec3,
-    pub bmin_simd: Packed_Vec3_x4,
-    pub bmax_simd: Packed_Vec3_x4,
+pub struct Leaf {
+    pub grid: [Material; GRID_SIZE],
 }
 
-impl TestGrid {
+const GRID_SIZE: usize = Leaf::VOXELS_PER_AXIS.pow(3);
+
+impl Leaf {
+    pub const VOXELS_PER_AXIS: usize = 8;
+    pub const VOXELS_PER_AXIS_F32: f32 = Leaf::VOXELS_PER_AXIS as f32;
+
+    /// not coords, just use for volume measurements
+    pub const BMIN: Vec3 = Vec3::new(0.0, 0.0, 0.0);
+    pub const BMAX: Vec3 = Vec3::new_filled(Leaf::VOXELS_PER_AXIS_F32 * VoxelInfo::VOXEL_SIZE);
+
+    pub const BMIN_SIMD: Packed_Vec3_x4 = Packed_Vec3_x4::from_single_const(Leaf::BMIN);
+    pub const BMAX_SIMD: Packed_Vec3_x4 = Packed_Vec3_x4::from_single_const(Leaf::BMAX);
+
     pub fn new() -> Self {
         let min = Vec3::default();
         let max = v3(
-            VoxelInfo::VOXEL_SIZE * 8.0,
-            VoxelInfo::VOXEL_SIZE * 8.0,
-            VoxelInfo::VOXEL_SIZE * 8.0,
+            VoxelInfo::VOXEL_SIZE * Leaf::VOXELS_PER_AXIS_F32,
+            VoxelInfo::VOXEL_SIZE * Leaf::VOXELS_PER_AXIS_F32,
+            VoxelInfo::VOXEL_SIZE * Leaf::VOXELS_PER_AXIS_F32,
         );
 
         //generate a default volume
@@ -35,13 +43,7 @@ impl TestGrid {
             }
         }
 
-        Self {
-            grid,
-            bmin: min,
-            bmax: max,
-            bmin_simd: min.into(),
-            bmax_simd: max.into(),
-        }
+        Self { grid }
     }
 
     /// trace the packet into the volume, return the 4 color values
@@ -60,61 +62,60 @@ impl TestGrid {
         let step_ys = directions.ys.signs();
         let step_zs = directions.zs.signs();
 
-        let deltas = inverse_dirs.abs();
+        let ida = inverse_dirs.abs();
 
-        let entry_xs = directions
+        let voxel_size = SimdF32::from_float(VoxelInfo::VOXEL_SIZE);
+        let voxels_per_unit = SimdF32::from_float(VoxelInfo::VOXELS_PER_UNIT);
+
+        let deltas_xs = ida.xs * voxel_size;
+        let deltas_ys = ida.ys * voxel_size;
+        let deltas_zs = ida.zs * voxel_size;
+
+        let entry_xs = (directions
             .xs
-            .mul_then_add(hit_distances.add(0.001.into()), origins.xs)
-            - self.bmin_simd.xs;
+            .mul_then_add(hit_distances.add(0.0001.into()), origins.xs)
+            - Self::BMIN_SIMD.xs)
+            * voxels_per_unit;
 
-        let entry_ys = directions
+        let entry_ys = (directions
             .ys
-            .mul_then_add(hit_distances.add(0.001.into()), origins.ys)
-            - self.bmin_simd.ys;
+            .mul_then_add(hit_distances.add(0.0001.into()), origins.ys)
+            - Self::BMIN_SIMD.ys)
+            * voxels_per_unit;
 
-        let entry_zs = directions
+        let entry_zs = (directions
             .zs
-            .mul_then_add(hit_distances.add(0.001.into()), origins.zs)
-            - self.bmin_simd.zs;
+            .mul_then_add(hit_distances.add(0.0001.into()), origins.zs)
+            - Self::BMIN_SIMD.zs)
+            * voxels_per_unit;
 
-        let upper_bound = SimdF32::from_float(7.999);
-
-        let cell_size = SimdF32::from_float(VoxelInfo::VOXEL_SIZE);
+        let upper_bound = SimdF32::from_float(7.9999);
 
         // FINALLY THE FIX TO THE WEIRD GODLY PILLARS FUCK MATH
         let current_xs = entry_xs.max(SimdF32::ZEROES).min(upper_bound).floor();
         let current_ys = entry_ys.max(SimdF32::ZEROES).min(upper_bound).floor();
         let current_zs = entry_zs.max(SimdF32::ZEROES).min(upper_bound).floor();
 
-        let mut tmax_xs = (current_xs.floor() - entry_xs + step_xs.max(SimdF32::ZEROES))
-            * inverse_dirs.xs
-            * cell_size;
+        let mut tmax_xs = hit_distances
+            + (current_xs.floor() - entry_xs + step_xs.max(SimdF32::ZEROES))
+                * inverse_dirs.xs
+                * voxel_size;
 
-        let mut tmax_ys = (current_ys.floor() - entry_ys + step_ys.max(SimdF32::ZEROES))
-            * inverse_dirs.ys
-            * cell_size;
+        let mut tmax_ys = hit_distances
+            + (current_ys.floor() - entry_ys + step_ys.max(SimdF32::ZEROES))
+                * inverse_dirs.ys
+                * voxel_size;
 
-        let mut tmax_zs = (current_zs.floor() - entry_zs + step_zs.max(SimdF32::ZEROES))
-            * inverse_dirs.zs
-            * cell_size;
+        let mut tmax_zs = hit_distances
+            + (current_zs.floor() - entry_zs + step_zs.max(SimdF32::ZEROES))
+                * inverse_dirs.zs
+                * voxel_size;
 
-        tmax_xs = SimdF32::select(
-            tmax_xs.is_eq_to(SimdF32::from_float(f32::NAN)),
-            SimdF32::INFY,
-            tmax_xs,
-        );
+        tmax_xs = SimdF32::select(tmax_xs.is_ne_to(tmax_xs), SimdF32::INFY, tmax_xs);
 
-        tmax_ys = SimdF32::select(
-            tmax_ys.is_eq_to(SimdF32::from_float(f32::NAN)),
-            SimdF32::INFY,
-            tmax_ys,
-        );
+        tmax_ys = SimdF32::select(tmax_ys.is_ne_to(tmax_ys), SimdF32::INFY, tmax_ys);
 
-        tmax_zs = SimdF32::select(
-            tmax_zs.is_eq_to(SimdF32::from_float(f32::NAN)),
-            SimdF32::INFY,
-            tmax_zs,
-        );
+        tmax_zs = SimdF32::select(tmax_zs.is_ne_to(tmax_zs), SimdF32::INFY, tmax_zs);
 
         let step_xs = step_xs.to_i32();
         let step_ys = step_ys.to_i32();
@@ -186,9 +187,9 @@ impl TestGrid {
 
             // update tmax and current position //
 
-            tmax_xs = SimdF32::select(mask_xs, tmax_xs + deltas.xs, tmax_xs);
-            tmax_ys = SimdF32::select(mask_ys, tmax_ys + deltas.ys, tmax_ys);
-            tmax_zs = SimdF32::select(mask_zs, tmax_zs + deltas.zs, tmax_zs);
+            tmax_xs = SimdF32::select(mask_xs, tmax_xs + deltas_xs, tmax_xs);
+            tmax_ys = SimdF32::select(mask_ys, tmax_ys + deltas_ys, tmax_ys);
+            tmax_zs = SimdF32::select(mask_zs, tmax_zs + deltas_zs, tmax_zs);
 
             current_xs = current_xs + SimdI32::select(mask_xs, step_xs, SimdI32::ZEROES);
             current_ys = current_ys + SimdI32::select(mask_ys, step_ys, SimdI32::ZEROES);

@@ -69,6 +69,14 @@ impl Packed_Vec3_x4 {
             zs: SimdF32::from(v.z),
         }
     }
+    #[inline(always)]
+    pub const fn from_single_const(v: Vec3) -> Self {
+        Self {
+            xs: SimdF32::from_float(v.x),
+            ys: SimdF32::from_float(v.y),
+            zs: SimdF32::from_float(v.z),
+        }
+    }
 
     #[inline(always)]
     /// get 1.0 for positive and -1.0 for negative

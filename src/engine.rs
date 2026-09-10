@@ -45,7 +45,7 @@ impl Engine {
     pub const MAX_FRAME_TIME: f32 = 0.25;
 
     pub fn new(render_width: usize, render_height: usize) -> Self {
-        let camera_pos = Vec3::new(4.0, 4.0, -32.0);
+        let camera_pos = Vec3::new(0.5, 0.5, -2.0);
         let aspect_ratio = render_width as f32 / render_height as f32;
 
         let mut camera = Camera::new(
@@ -57,7 +57,7 @@ impl Engine {
             0.0,
             0.0,
         );
-        camera.look_at(v3(4.0, 4.0, 4.0));
+        camera.look_at(v3(0.5, 0.5, 0.5));
 
         Self {
             render_distance: 64.0,

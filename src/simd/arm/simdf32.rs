@@ -106,6 +106,10 @@ impl SimdF32 {
     pub fn is_eq_to(self, other: Self) -> SimdU32 {
         unsafe { vceqq_f32(self.data, other.data).into() }
     }
+    #[inline(always)]
+    pub fn is_ne_to(self, other: Self) -> SimdU32 {
+        self.is_eq_to(other).not()
+    }
 
     #[inline(always)]
     pub fn is_less_than(self, other: Self) -> SimdU32 {

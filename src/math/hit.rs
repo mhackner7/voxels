@@ -42,12 +42,9 @@ impl HitInfo {
 pub fn simd_aabb(
     ro: Packed_Vec3_x4,
     inv_dir: Packed_Vec3_x4,
-    bmin: Vec3,
-    bmax: Vec3,
+    bmin: Packed_Vec3_x4,
+    bmax: Packed_Vec3_x4,
 ) -> (SimdF32, SimdU32) {
-    let bmin = Packed_Vec3_x4::from(bmin);
-    let bmax = Packed_Vec3_x4::from(bmax);
-
     let xs1 = (bmin.xs - ro.xs) * inv_dir.xs;
     let xs2 = (bmax.xs - ro.xs) * inv_dir.xs;
 

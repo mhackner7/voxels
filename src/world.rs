@@ -1,18 +1,18 @@
 use crate::world::voxel::Material;
-use crate::{math::hit::simd_aabb, simd::packetray::Packet, world::testgrid::TestGrid};
+use crate::{math::hit::simd_aabb, simd::packetray::Packet, world::leaf::Leaf};
 
-pub mod testgrid;
+pub mod leaf;
 pub mod voxel;
 
 pub struct World {
-    pub grid: TestGrid,
+    pub test_leaf: Leaf,
     pub rebuild_time: f32,
 }
 
 impl World {
     pub fn new() -> Self {
         World {
-            grid: TestGrid::new(),
+            test_leaf: Leaf::new(),
             rebuild_time: 0.0,
         }
     }
@@ -21,7 +21,7 @@ impl World {
         self.rebuild_time += dt;
         if self.rebuild_time >= 5.0 {
             self.rebuild_time = 0.0;
-            self.grid = TestGrid::new();
+            self.test_leaf = Leaf::new();
         }
     }
 
@@ -29,9 +29,9 @@ impl World {
         let (distances, hit_mask) = simd_aabb(
             packet.origins,
             packet.inverse_dirs,
-            self.grid.bmin,
-            self.grid.bmax,
+            Leaf::BMIN_SIMD,
+            Leaf::BMAX_SIMD,
         );
-        self.grid.trace(packet, distances, hit_mask)
+        self.test_leaf.trace(packet, distances, hit_mask)
     }
 }

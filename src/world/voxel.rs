@@ -54,7 +54,7 @@ impl VoxelInfo {
     /// minecraft voxels = 1 meter^3
     /// lay of the land = 0.1 meter^3
     /// size of voxel volumes is dependant on this
-    pub const VOXEL_SIZE: f32 = 1.0;
+    pub const VOXEL_SIZE: f32 = 1.0 / 8.0;
     pub const VOXELS_PER_UNIT: f32 = 1.0 / Self::VOXEL_SIZE;
 
     #[inline(always)]
