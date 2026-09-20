@@ -2,6 +2,7 @@ use crate::world::voxel::Material;
 use crate::{math::hit::simd_aabb, simd::packetray::Packet, world::leaf::Leaf};
 
 pub mod leaf;
+pub mod tree64;
 pub mod voxel;
 
 pub struct World {

@@ -137,7 +137,7 @@ impl Leaf {
         let mut active_rays = active_rays; // the rays that are still active
         let mut valid_rays = active_rays; // the rays that are still valid for the given volume 
 
-        for _ in 0..(4 * 4 * 4) {
+        for _ in 0..(8 + 8 + 8) {
             // fetch voxel of current position for active rays //
             let xcurr = current_xs.to_array();
             let ycurr = current_ys.to_array();
@@ -160,7 +160,7 @@ impl Leaf {
 
                 let index = x + (y * 8) + (z * 8 * 8);
 
-                let voxel = self.grid[index as usize].clone();
+                let voxel = self.grid[index as usize];
 
                 if voxel != Material::Air {
                     active[i] = 0;

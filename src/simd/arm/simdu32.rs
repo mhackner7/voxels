@@ -78,6 +78,16 @@ impl SimdU32 {
         unsafe { vmvnq_u32(vceqq_u32(self.data, other.data)).into() }
     }
 
+    #[inline(always)]
+    pub fn all_equal(self) -> bool {
+        unsafe {
+            let all_set = vdupq_n_u32(vgetq_lane_u32::<0>(self.data));
+            let mask = vceqq_u32(all_set, self.data);
+            let min = vminvq_u32(mask);
+            min != 0
+        }
+    }
+
     /// not
     #[inline(always)]
     pub fn not(self) -> Self {
@@ -93,7 +103,7 @@ impl SimdU32 {
     /// which ones are not zero
     #[inline(always)]
     pub fn not_zero(self) -> Self {
-        unsafe { vmvnq_u32(vceqq_u32(self.data, Self::ZEROES.data)).into() }
+        unsafe { vcgtq_u32(self.data, Self::ZEROES.data).into() }
     }
 
     /// select -> self ? true : false

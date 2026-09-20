@@ -1,7 +1,7 @@
 use crate::simd::arm::simdf32::SimdF32;
 use crate::simd::arm::simdu32::SimdU32;
 use std::arch::aarch64::*;
-use std::ops::{Add, BitAnd, BitOr};
+use std::ops::{Add, BitAnd, BitOr, Sub};
 
 #[repr(C)]
 #[repr(align(16))] // just in case manually align to 16 bytes (or 128 bits)
@@ -60,6 +60,14 @@ impl SimdI32 {
     #[inline(always)]
     pub fn less_than(self, other: Self) -> SimdU32 {
         unsafe { vcltq_s32(self.data, other.data).into() }
+    }
+    #[inline(always)]
+    pub fn sub(self, other: Self) -> Self {
+        unsafe { vsubq_s32(self.data, other.data).into() }
+    }
+    #[inline(always)]
+    pub fn neg(self) -> Self {
+        unsafe { vnegq_s32(self.data).into() }
     }
 
     /// logical and
@@ -140,5 +148,11 @@ impl Add for SimdI32 {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
         self.add(rhs)
+    }
+}
+impl Sub for SimdI32 {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.sub(rhs)
     }
 }
