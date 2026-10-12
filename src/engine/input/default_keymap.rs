@@ -46,9 +46,9 @@ impl std::default::Default for crate::engine::input::keymap::KeyMap {
         i = Command::Inventory(InventoryCommands::Back).index();
         keycodes_from_commands[i] = KBMcode::ArrowLeft;
         i = Command::Inventory(InventoryCommands::Split).index();
-        keycodes_from_commands[i] = KBMcode::Digit1;
+        keycodes_from_commands[i] = KBMcode::Digit8;
         i = Command::Inventory(InventoryCommands::QuickMove).index();
-        keycodes_from_commands[i] = KBMcode::Digit2;
+        keycodes_from_commands[i] = KBMcode::Digit9;
 
         // Developer Commands
         i = Command::Developer(DeveloperCommands::Pause).index();
@@ -60,11 +60,11 @@ impl std::default::Default for crate::engine::input::keymap::KeyMap {
         i = Command::Developer(DeveloperCommands::VolumeDown).index();
         keycodes_from_commands[i] = KBMcode::AudioVolumeDown;
         i = Command::Developer(DeveloperCommands::OpenDevMenu).index();
-        keycodes_from_commands[i] = KBMcode::Backquote;
+        keycodes_from_commands[i] = KBMcode::Digit3;
         i = Command::Developer(DeveloperCommands::ShowDebugInfoLight).index();
-        keycodes_from_commands[i] = KBMcode::F3;
+        keycodes_from_commands[i] = KBMcode::Digit1;
         i = Command::Developer(DeveloperCommands::ShowDebugInfoHeavy).index();
-        keycodes_from_commands[i] = KBMcode::F4;
+        keycodes_from_commands[i] = KBMcode::Digit2;
         i = Command::Developer(DeveloperCommands::ForceMinimize).index();
         keycodes_from_commands[i] = KBMcode::F12;
         i = Command::Developer(DeveloperCommands::ToggleFullscreen).index();

@@ -1,38 +1,33 @@
-use crate::world::voxel::Material;
-use crate::{math::hit::simd_aabb, simd::packetray::Packet, world::leaf::Leaf};
+use crate::world::sun::Sun;
+use crate::world::tree64::Tree64;
 
+pub mod build;
+pub mod collision;
 pub mod leaf;
+pub mod sun;
+pub mod terrain;
 pub mod tree64;
 pub mod voxel;
 
 pub struct World {
-    pub test_leaf: Leaf,
-    pub rebuild_time: f32,
+    pub tree: Tree64,
+    /// the one sun, everything that gets lit reads it from here
+    pub sun: Sun,
 }
 
 impl World {
     pub fn new() -> Self {
+        println!("[World] Initializing voxel world with procedural seed 42...");
         World {
-            test_leaf: Leaf::new(),
-            rebuild_time: 0.0,
+            tree: Tree64::build(42),
+            sun: Sun::default(),
         }
     }
 
-    pub fn update(&mut self, dt: f32) {
-        self.rebuild_time += dt;
-        if self.rebuild_time >= 5.0 {
-            self.rebuild_time = 0.0;
-            self.test_leaf = Leaf::new();
-        }
+    /// put the sun somewhere else (degrees), angles get wrapped / clamped by Sun::new
+    pub fn set_sun(&mut self, azimuth: f32, elevation: f32) {
+        self.sun = Sun::new(azimuth, elevation);
     }
 
-    pub fn trace(&self, packet: Packet) -> ([Material; 4], [f32; 4], [u32; 4]) {
-        let (distances, hit_mask) = simd_aabb(
-            packet.origins,
-            packet.inverse_dirs,
-            Leaf::BMIN_SIMD,
-            Leaf::BMAX_SIMD,
-        );
-        self.test_leaf.trace(packet, distances, hit_mask)
-    }
+    pub fn update(&mut self, _dt: f32) {}
 }

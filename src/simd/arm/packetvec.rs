@@ -1,11 +1,12 @@
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Mul, Sub};
 
 use crate::math::vec3::Vec3;
 use crate::simd::arm::simdf32::SimdF32;
+use crate::simd::arm::simdu32::SimdU32;
 
 #[repr(C)]
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Packed_Vec3_x4 {
     pub xs: SimdF32,
     pub ys: SimdF32,
@@ -43,12 +44,10 @@ impl Packed_Vec3_x4 {
 
     #[inline(always)]
     pub const fn float(val: f32) -> Self {
-        unsafe {
-            Self {
-                xs: std::mem::transmute([val; 4]),
-                ys: std::mem::transmute([val; 4]),
-                zs: std::mem::transmute([val; 4]),
-            }
+        Self {
+            xs: SimdF32::from_float(val),
+            ys: SimdF32::from_float(val),
+            zs: SimdF32::from_float(val),
         }
     }
 
@@ -64,17 +63,17 @@ impl Packed_Vec3_x4 {
     #[inline(always)]
     pub fn from_single(v: Vec3) -> Self {
         Self {
-            xs: SimdF32::from(v.x),
-            ys: SimdF32::from(v.y),
-            zs: SimdF32::from(v.z),
+            xs: SimdF32::from(v.data[0]),
+            ys: SimdF32::from(v.data[1]),
+            zs: SimdF32::from(v.data[2]),
         }
     }
     #[inline(always)]
     pub const fn from_single_const(v: Vec3) -> Self {
         Self {
-            xs: SimdF32::from_float(v.x),
-            ys: SimdF32::from_float(v.y),
-            zs: SimdF32::from_float(v.z),
+            xs: SimdF32::from_float(v.data[0]),
+            ys: SimdF32::from_float(v.data[1]),
+            zs: SimdF32::from_float(v.data[2]),
         }
     }
 
@@ -135,12 +134,62 @@ impl Packed_Vec3_x4 {
     }
 
     #[inline(always)]
+    pub fn dot(self, other: Self) -> SimdF32 {
+        self.xs
+            .mul_then_add(other.xs, self.ys.mul_then_add(other.ys, self.zs * other.zs))
+    }
+
+    #[inline(always)]
+    /// every lane's vector times that lane's scalar
+    pub fn scale(self, s: SimdF32) -> Self {
+        Self {
+            xs: self.xs * s,
+            ys: self.ys * s,
+            zs: self.zs * s,
+        }
+    }
+
+    #[inline(always)]
+    /// self + other * s, per lane
+    pub fn add_scaled(self, other: Self, s: SimdF32) -> Self {
+        Self {
+            xs: other.xs.mul_then_add(s, self.xs),
+            ys: other.ys.mul_then_add(s, self.ys),
+            zs: other.zs.mul_then_add(s, self.zs),
+        }
+    }
+
+    #[inline(always)]
+    pub fn normalize(self) -> Self {
+        self.scale(self.dot(self).inv_sqrt())
+    }
+
+    #[inline(always)]
+    pub fn neg(self) -> Self {
+        Self {
+            xs: self.xs.neg(),
+            ys: self.ys.neg(),
+            zs: self.zs.neg(),
+        }
+    }
+
+    #[inline(always)]
+    /// select -> cond ? true : false, per lane
+    pub fn select(condition_mask: SimdU32, if_true: Self, if_false: Self) -> Self {
+        Self {
+            xs: SimdF32::select(condition_mask, if_true.xs, if_false.xs),
+            ys: SimdF32::select(condition_mask, if_true.ys, if_false.ys),
+            zs: SimdF32::select(condition_mask, if_true.zs, if_false.zs),
+        }
+    }
+
+    #[inline(always)]
     /// (mul1 * mul2) + add
     fn mul_add(mul1: Self, mul2: Self, add: Self) -> Self {
         Self {
             xs: SimdF32::mul_add(add.xs, mul1.xs, mul2.xs),
             ys: SimdF32::mul_add(add.ys, mul1.ys, mul2.ys),
-            zs: SimdF32::mul_add(add.zs, mul1.zs, mul2.xs),
+            zs: SimdF32::mul_add(add.zs, mul1.zs, mul2.zs),
         }
     }
 

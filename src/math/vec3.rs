@@ -1,5 +1,3 @@
-use crate::math::ivec3::IVec3;
-use std::f32::{INFINITY, NAN};
 use std::mem::{size_of, transmute};
 use std::ops::{
     Add, AddAssign, Div, DivAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign,
@@ -11,23 +9,8 @@ pub struct Vec3 {
     pub data: [f32; 3],
 }
 
-pub type Color = Vec3;
-pub type Point = Vec3;
-
-pub fn dot(lhs: Vec3, rhs: Vec3) -> f32 {
-    lhs.dot(rhs)
-}
-
-pub fn cross(lhs: Vec3, rhs: Vec3) -> Vec3 {
-    lhs.cross(rhs)
-}
-
 pub const fn v3(x: f32, y: f32, z: f32) -> Vec3 {
     Vec3::new(x, y, z)
-}
-
-pub const fn color(r: f32, g: f32, b: f32) -> Color {
-    Color::new(r, g, b)
 }
 
 impl Vec3 {
@@ -53,18 +36,6 @@ impl Vec3 {
     pub const Z_NEG_NORMAL: Vec3 = Self::new(0.0, 0.0, -1.0);
 
     #[inline(always)]
-    pub fn get_face_normal(axis: usize, step: i32) -> Vec3 {
-        const NORMALS: [[Vec3; 2]; 3] = [
-            [Vec3::X_NEG_NORMAL, Vec3::X_POS_NORMAL],
-            [Vec3::Y_NEG_NORMAL, Vec3::Y_POS_NORMAL],
-            [Vec3::Z_NEG_NORMAL, Vec3::Z_POS_NORMAL],
-        ];
-
-        let sign = (step + 1) as usize >> 1;
-        NORMALS[axis][sign]
-    }
-
-    #[inline(always)]
     pub fn normalize(self) -> Self {
         self / self.length()
     }
@@ -78,7 +49,7 @@ impl Vec3 {
     pub fn fix_nan(mut self) -> Self {
         for value in &mut self.data {
             if value.is_nan() {
-                *value = INFINITY;
+                *value = f32::INFINITY;
             }
         }
 
@@ -200,21 +171,6 @@ impl Vec3 {
     pub fn abs(self) -> Self {
         Self {
             data: [self.data[0].abs(), self.data[1].abs(), self.data[2].abs()],
-        }
-    }
-
-    #[inline]
-    pub fn tmax_from(step: IVec3, entry_pos: Vec3, inverse_dir: Vec3) -> Vec3 {
-        let sx = (step[0] > 0) as i32 as f32;
-        let sy = (step[1] > 0) as i32 as f32;
-        let sz = (step[2] > 0) as i32 as f32;
-
-        Self {
-            data: [
-                (sx - entry_pos.data[0].fract()) * inverse_dir.data[0],
-                (sy - entry_pos.data[1].fract()) * inverse_dir.data[1],
-                (sz - entry_pos.data[2].fract()) * inverse_dir.data[2],
-            ],
         }
     }
 
@@ -372,12 +328,5 @@ impl Div<Vec3> for f32 {
     #[inline(always)]
     fn div(self, rhs: Vec3) -> Vec3 {
         rhs / self
-    }
-}
-
-impl From<IVec3> for Vec3 {
-    #[inline(always)]
-    fn from(value: IVec3) -> Self {
-        Self::new(value[0] as f32, value[1] as f32, value[2] as f32)
     }
 }

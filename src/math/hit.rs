@@ -1,37 +1,5 @@
-use crate::math::vec3::Vec3;
 use crate::simd::simdu32::SimdU32;
 use crate::simd::{packetvec::Packed_Vec3_x4, simdf32::SimdF32};
-
-type Material = u32;
-
-pub struct HitInfo {
-    pub normal: Vec3,
-    pub distance: f32,
-    pub material: Material,
-    pub is_valid: bool,
-}
-
-impl HitInfo {
-    pub const DUD: HitInfo = HitInfo::new(Vec3::DEFAULT, 1e30, 0, false);
-
-    #[inline(always)]
-    pub const fn new(normal: Vec3, distance: f32, material: Material, is_valid: bool) -> HitInfo {
-        HitInfo {
-            normal,
-            distance,
-            material,
-            is_valid,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn exit_volume_at(distance: f32) -> HitInfo {
-        HitInfo {
-            distance,
-            ..HitInfo::DUD
-        }
-    }
-}
 
 #[inline(always)]
 /// packed simd aabb testing

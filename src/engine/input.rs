@@ -6,34 +6,68 @@ pub mod keymap;
 pub mod util;
 
 use crate::engine::input::commands::*;
+use crate::engine::player::GaitState;
 
 use super::*;
 
 impl Engine {
+    /// everything the keys and mouse do this frame:
+    /// ui toggles, looking around, then moving the player through the world
     pub fn handle_input(&mut self, dt: f32) {
-        self.mouse_motion();
-
         self.input.process(dt);
         self.input.activity.print_maybe();
 
-        let is_held = |cmd| self.input.activity.is_held(cmd) as i32 as f32;
-        let was_pressed = |cmd| self.input.activity.was_pressed(cmd);
-
-        if was_pressed(DeveloperCommands::ToggleFullscreen.into()) {
+        if self
+            .input
+            .activity
+            .was_pressed(DeveloperCommands::ToggleFullscreen.into())
+        {
             self.set_fullscreen = !self.set_fullscreen;
         }
 
+        self.ui_input();
+
+        // the dev menu eats the movement keys and the mouse while it's open, //
+        // gravity still runs though
+
+        let (wish, gait, tapped, swim) = if self.ui.menu {
+            self.input.last_mouse_motion = (0.0, 0.0);
+            (Vec3::DEFAULT, GaitState::Still, false, false)
+        } else {
+            self.mouse_motion();
+            self.wish_move(dt)
+        };
+
+        let jump = self.player.tap_jump(dt, tapped);
+        let before = self.player.position;
+
+        self.player.update(&self.world, wish, dt, jump, swim, gait);
+        self.camera.center = self.player.position;
+
+        // only a real move restarts the image, pushing into a wall doesn't //
+
+        if self.player.position.data != before.data {
+            self.frame_accumulation_count = 0;
+        }
+    }
+
+    /// the move the keys ask for this frame (meters), how it's being asked,
+    /// and space tapped / held
+    fn wish_move(&self, dt: f32) -> (Vec3, GaitState, bool, bool) {
+        let is_held = |cmd| self.input.activity.is_held(cmd) as i32 as f32;
+
         let base_speed = 3.0 * dt;
-        let modified_speed = ((is_held(PlayerCommands::Sprint.into()) * base_speed) + base_speed);
+        let sprint = is_held(PlayerCommands::Sprint.into());
+        let modified_speed = (sprint * base_speed) + base_speed;
 
         let mut front = self.camera.front;
-        front.y = 0.0;
+        front[1] = 0.0;
         if front.length_squared() > 0.0 {
             front = front.normalize();
         }
 
         let mut right = self.camera.right;
-        right.y = 0.0;
+        right[1] = 0.0;
         if right.length_squared() > 0.0 {
             right = right.normalize();
         }
@@ -42,7 +76,8 @@ impl Engine {
             - is_held(PlayerCommands::MoveBackward.into());
         let x_move =
             is_held(PlayerCommands::MoveRight.into()) - is_held(PlayerCommands::MoveLeft.into());
-        let y_move = is_held(PlayerCommands::Jump.into()) - is_held(PlayerCommands::Sneak.into());
+        let jump = is_held(PlayerCommands::Jump.into());
+        let sneak = is_held(PlayerCommands::Sneak.into());
 
         let mut movement = (front * z_move) + (right * x_move);
 
@@ -50,17 +85,21 @@ impl Engine {
             movement = movement.normalize();
         }
         movement *= modified_speed;
-        movement.y = y_move * base_speed;
+        movement[1] = (jump - sneak) * base_speed;
 
-        if movement.length_squared() > 0.0001 {
-            let old_center = self.camera.center;
-            self.camera.center += movement;
+        let gait = if sneak > 0.0 {
+            GaitState::Sneaking
+        } else if z_move == 0.0 && x_move == 0.0 {
+            GaitState::Still
+        } else if sprint > 0.0 {
+            GaitState::Sprinting
+        } else {
+            GaitState::Walking
+        };
 
-            if (self.camera.center - old_center).length_squared() > 0.000001 {
-                self.frame_accumulation_count = 0;
-                self.camera.update();
-            }
-        }
+        let tapped = self.input.activity.was_pressed(PlayerCommands::Jump.into());
+
+        (movement, gait, tapped, jump > 0.0)
     }
 
     pub fn mouse_motion(&mut self) {

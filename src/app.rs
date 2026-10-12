@@ -1,7 +1,7 @@
-use pixels::{Pixels, SurfaceTexture};
+use pixels::{Pixels, ScalingMode, SurfaceTexture};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::error::EventLoopError;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -13,9 +13,9 @@ use crate::engine::Engine;
 pub struct App<'a> {
     window: Option<Arc<Window>>,
     pixel_buffer: Option<Pixels<'a>>,
+    /// window size, logical before the window exists, physical after
     width: usize,
     height: usize,
-    render_scale: f64,
     engine: Engine, // scale_factor: u32,
                     // camera: Camera,
                     // raytracer : RayTracer,
@@ -25,29 +25,17 @@ pub struct App<'a> {
 }
 
 impl App<'_> {
-    pub fn new(width: usize, height: usize, render_scale: f64) -> Self {
+    /// render_rows is the fixed render height, the width follows the window aspect
+    pub fn new(width: usize, height: usize, render_rows: usize) -> Self {
+        let (render_width, render_height) = render_size(width, height, render_rows);
+
         Self {
             window: None,
             pixel_buffer: None,
-            render_scale,
             width,
             height,
-            engine: Engine::new(
-                (width as f64 * render_scale) as usize,
-                (height as f64 * render_scale) as usize,
-            ),
+            engine: Engine::new(render_width, render_height),
         }
-    }
-
-    pub fn with_resolution(mut self, width: usize, height: usize) -> Self {
-        self.width = width;
-        self.height = height;
-        self
-    }
-
-    pub fn with_render_scale(mut self, scale: f64) -> Self {
-        self.render_scale = scale;
-        self
     }
 
     pub fn new_event_loop() -> Result<EventLoop<()>, EventLoopError> {
@@ -56,33 +44,26 @@ impl App<'_> {
         Ok(el)
     }
 
+    /// the surface always follows the window, the render buffer only
+    /// changes with the window aspect or the render rows, never with its size
     fn resize_window_to(&mut self, size: PhysicalSize<u32>) {
-        let width = size.width;
-        let height = size.height;
+        let width = size.width.max(1);
+        let height = size.height.max(1);
         let px_ref = self.pixel_buffer.as_mut().unwrap();
-
-        let render_width = (width as f64 * self.render_scale) as usize;
-        let render_height = (height as f64 * self.render_scale) as usize;
-
-        let tile_size = Engine::PIXELS_PER_TILE_AXIS;
-        self.engine.render_width = ((render_width / tile_size) * tile_size).max(1);
-        self.engine.render_height = ((render_height / tile_size) * tile_size).max(1);
-
-        self.engine.camera.render_width = self.engine.render_width;
-        self.engine.camera.render_height = self.engine.render_height;
-        self.engine.camera.aspect_ratio =
-            self.engine.render_width as f32 / self.engine.render_height as f32;
-        self.engine.camera.update();
 
         if let Err(e) = px_ref.resize_surface(width, height) {
             eprintln!("pixel surface resizing error: {e}");
         }
 
-        if let Err(e) = px_ref.resize_buffer(
-            self.engine.render_width as u32,
-            self.engine.render_height as u32,
-        ) {
-            eprintln!("pixel buffer resizing error: {e}");
+        let (render_width, render_height) =
+            render_size(width as usize, height as usize, self.engine.render_rows);
+
+        if (render_width, render_height) != (self.engine.render_width, self.engine.render_height) {
+            if let Err(e) = px_ref.resize_buffer(render_width as u32, render_height as u32) {
+                eprintln!("pixel buffer resizing error: {e}");
+            }
+
+            self.engine.resize(render_width, render_height);
         }
 
         self.width = width as usize;
@@ -96,7 +77,7 @@ impl App<'_> {
 
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_size = PhysicalSize::new(self.width as u32, self.height as u32);
+        let window_size = LogicalSize::new(self.width as u32, self.height as u32);
         let resize_inc = PhysicalSize::new(16, 16);
 
         let attributes = WindowAttributes::default()
@@ -108,32 +89,37 @@ impl ApplicationHandler for App<'_> {
             .with_decorations(true)
             .with_visible(true);
 
-        eprintln!("Opening Window");
+        println!("[App] Creating window ({}x{})...", self.width, self.height);
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
-        window
+        let _ = window
             .set_cursor_grab(CursorGrabMode::Confined)
-            .or_else(|_e| window.set_cursor_grab(CursorGrabMode::Locked))
-            .unwrap();
+            .or_else(|_e| window.set_cursor_grab(CursorGrabMode::Locked));
         window.set_cursor_visible(false);
 
-        eprintln!("Opening Pixel Buffer");
-        let surface_texture =
-            SurfaceTexture::new(window_size.width, window_size.height, window.clone());
+        let surface_size = window.inner_size();
+        let (render_width, render_height) = (self.engine.render_width, self.engine.render_height);
+        println!(
+            "[App] Allocating Pixels texture buffer (render: {}x{}, surface: {}x{})...",
+            render_width, render_height, surface_size.width, surface_size.height
+        );
 
-        let render_width = (self.width as f64 * self.render_scale) as u32;
-        let render_height = (self.height as f64 * self.render_scale) as u32;
-        self.pixel_buffer =
-            Some(Pixels::new(render_width, render_height, surface_texture).unwrap());
+        let surface_texture =
+            SurfaceTexture::new(surface_size.width, surface_size.height, window.clone());
+
+        // the low resolution buffer is stretched over the whole window, filtered //
+
+        let mut pixels =
+            Pixels::new(render_width as u32, render_height as u32, surface_texture).unwrap();
+        pixels.set_scaling_mode(ScalingMode::Fill);
+        self.pixel_buffer = Some(pixels);
 
         self.window = Some(window);
 
-        self.resize_window_to(window_size);
+        self.resize_window_to(surface_size);
 
+        println!("[App] Graphics pipeline ready. Starting first frame render request.");
         self.window.as_ref().unwrap().request_redraw();
-
-        self.width = window_size.width as usize;
-        self.height = window_size.height as usize;
     }
 
     fn window_event(
@@ -165,7 +151,17 @@ impl ApplicationHandler for App<'_> {
                     }
                 }
 
+                // the dev menu changed the render rows //
+
+                if self.engine.resize_render {
+                    self.engine.resize_render = false;
+                    let size = self.window.as_ref().unwrap().inner_size();
+                    self.resize_window_to(size);
+                }
+
+                let present_start = std::time::Instant::now();
                 self.pixel_buffer.as_mut().unwrap().render().unwrap();
+                self.engine.present_ms = present_start.elapsed().as_secs_f32() * 1000.0;
 
                 self.window.as_ref().unwrap().request_redraw();
             }
@@ -208,8 +204,17 @@ impl ApplicationHandler for App<'_> {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            eprintln!("Mouse Moved! delta: {:?}", delta);
             self.engine.input.last_mouse_motion = delta;
         }
     }
+}
+
+/// render buffer size for a window: fixed rows, the width keeps the window aspect,
+/// both rounded to whole 16 pixel tiles
+fn render_size(window_width: usize, window_height: usize, rows: usize) -> (usize, usize) {
+    let tile = Engine::PIXELS_PER_TILE_AXIS;
+    let aspect = window_width as f64 / window_height.max(1) as f64;
+    let width = ((rows as f64 * aspect / tile as f64).round() as usize).max(1) * tile;
+
+    (width, (rows / tile).max(1) * tile)
 }

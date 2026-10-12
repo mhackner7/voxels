@@ -13,13 +13,14 @@ pub struct SimdI32 {
 impl SimdI32 {
     pub const ZEROES: Self = unsafe { std::mem::transmute([0; 4]) };
     pub const FOURS: Self = unsafe { std::mem::transmute([4; 4]) };
+    pub const ONES: Self = unsafe { std::mem::transmute([1; 4]) };
 
     #[inline(always)]
     pub fn to_array(self) -> [i32; 4] {
         unsafe {
             let mut a = [0i32; 4];
             vst1q_s32(a.as_mut_ptr(), self.data);
-            return a;
+            a
         }
     }
 
@@ -31,6 +32,14 @@ impl SimdI32 {
     #[inline(always)]
     pub fn max(self, other: Self) -> Self {
         unsafe { vmaxq_s32(self.data, other.data).into() }
+    }
+    #[inline(always)]
+    pub fn min(self, other: Self) -> Self {
+        unsafe { vminq_s32(self.data, other.data).into() }
+    }
+    #[inline(always)]
+    pub fn clamp_to(self, min: Self, max: Self) -> Self {
+        self.max(min).min(max)
     }
     #[inline(always)]
     pub fn reinterpret_as_f32(self) -> SimdF32 {
@@ -48,8 +57,18 @@ impl SimdI32 {
 
     /// logical left shift
     #[inline(always)]
-    pub fn shll<const shamt: i32>(self) -> Self {
-        unsafe { vshlq_n_s32::<shamt>(self.data).into() }
+    pub fn shll<const SHAMT: i32>(self) -> Self {
+        unsafe { vshlq_n_s32::<SHAMT>(self.data).into() }
+    }
+    /// arithmetic right shift
+    #[inline(always)]
+    pub fn shr<const SHAMT: i32>(self) -> Self {
+        unsafe { vshrq_n_s32::<SHAMT>(self.data).into() }
+    }
+    /// left shift by a per lane amount
+    #[inline(always)]
+    pub fn shlv(self, shift: Self) -> Self {
+        unsafe { vshlq_s32(self.data, shift.data).into() }
     }
 
     #[inline(always)]
@@ -84,8 +103,12 @@ impl SimdI32 {
     pub fn or(self, other: Self) -> Self {
         unsafe { vorrq_s32(self.data, other.data).into() }
     }
+    /// logical xor
+    #[inline(always)]
+    pub fn xor(self, other: Self) -> Self {
+        unsafe { veorq_s32(self.data, other.data).into() }
+    }
 
-    /// logical or
     #[inline(always)]
     pub fn outside_range(self, min: Self, max: Self) -> SimdU32 {
         unsafe {

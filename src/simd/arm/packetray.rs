@@ -13,116 +13,44 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// built from packed origins and directions (directions must be normalized)
+    /// zero direction components get a tiny stand in so the inverse never hits infinity
+    #[inline(always)]
+    pub fn new(origins: Packed_Vec3_x4, directions: Packed_Vec3_x4) -> Self {
+        let guard = |d: SimdF32| SimdF32::select(d.is_eq_to(SimdF32::ZEROES), SimdF32::TINY, d);
+
+        let inverse_dirs = Packed_Vec3_x4 {
+            xs: guard(directions.xs).recip(),
+            ys: guard(directions.ys).recip(),
+            zs: guard(directions.zs).recip(),
+        };
+
+        Self {
+            origins,
+            directions,
+            inverse_dirs,
+        }
+    }
+
     /// built from 4 origin vectors and 4 direction vectors
+    #[cfg(test)]
     pub fn from_vecs(origins: [Vec3; 4], directions: [Vec3; 4]) -> Self {
-        let origins_x: [f32; 4] = [origins[0].x, origins[1].x, origins[2].x, origins[3].x];
-        let origins_y: [f32; 4] = [origins[0].y, origins[1].y, origins[2].y, origins[3].y];
-        let origins_z: [f32; 4] = [origins[0].z, origins[1].z, origins[2].z, origins[3].z];
+        let lane = |v: [Vec3; 4], axis: usize| [v[0][axis], v[1][axis], v[2][axis], v[3][axis]];
 
-        let origins = Packed_Vec3_x4::new(origins_x, origins_y, origins_z);
-
-        let directions_x: [f32; 4] = [
-            directions[0].x,
-            directions[1].x,
-            directions[2].x,
-            directions[3].x,
-        ];
-
-        let directions_y: [f32; 4] = [
-            directions[0].y,
-            directions[1].y,
-            directions[2].y,
-            directions[3].y,
-        ];
-
-        let directions_z: [f32; 4] = [
-            directions[0].z,
-            directions[1].z,
-            directions[2].z,
-            directions[3].z,
-        ];
-
-        let directions = Packed_Vec3_x4::new(directions_x, directions_y, directions_z);
-
-        let mask_x = directions.xs.is_eq_to(SimdF32::ZEROES);
-        let dxs = SimdF32::select(mask_x, SimdF32::TINY, directions.xs);
-
-        let mask_y = directions.ys.is_eq_to(SimdF32::ZEROES);
-        let dys = SimdF32::select(mask_y, SimdF32::TINY, directions.ys);
-
-        let mask_z = directions.zs.is_eq_to(SimdF32::ZEROES);
-        let dzs = SimdF32::select(mask_z, SimdF32::TINY, directions.zs);
-
-        let inverse_dirs = Packed_Vec3_x4 {
-            xs: dxs.recip(),
-            ys: dys.recip(),
-            zs: dzs.recip(),
-        };
-
-        Self {
-            origins,
-            directions,
-            inverse_dirs,
-        }
+        Self::new(
+            Packed_Vec3_x4::new(lane(origins, 0), lane(origins, 1), lane(origins, 2)),
+            Packed_Vec3_x4::new(
+                lane(directions, 0),
+                lane(directions, 1),
+                lane(directions, 2),
+            ),
+        )
     }
 
-    /// built from the pixel origin and direction as well as offsets
-    pub fn from_pixel(
-        pixel00_center: Vec3,
-        camera_origin: Vec3,
-        pixel_delta_x: Vec3,
-        pixel_delta_y: Vec3,
-    ) -> Self {
-        let origins = Packed_Vec3_x4::from_single(camera_origin);
-
-        //    pixels corresponding to tile in packet
-        //    A B
-        //    C D
-        let a = pixel00_center;
-        let b = a + pixel_delta_x;
-        let c = a - pixel_delta_y;
-        let d = b - pixel_delta_y;
-
-        let xs = SimdF32::from([a.x, b.x, c.x, d.x]) - origins.xs;
-        let ys = SimdF32::from([a.y, b.y, c.y, d.y]) - origins.ys;
-        let zs = SimdF32::from([a.z, b.z, c.z, d.z]) - origins.zs;
-
-        let length_squared = xs.mul_then_add(xs, ys.mul_then_add(ys, SimdF32::mul(zs, zs)));
-
-        let inv_length = length_squared.inv_sqrt();
-
-        let directions = Packed_Vec3_x4 {
-            xs: xs * inv_length,
-            ys: ys * inv_length,
-            zs: zs * inv_length,
-        };
-
-        let mask_x = directions.xs.is_eq_to(SimdF32::ZEROES);
-        let dxs = SimdF32::select(mask_x, SimdF32::TINY, directions.xs);
-
-        let mask_y = directions.ys.is_eq_to(SimdF32::ZEROES);
-        let dys = SimdF32::select(mask_y, SimdF32::TINY, directions.ys);
-
-        let mask_z = directions.zs.is_eq_to(SimdF32::ZEROES);
-        let dzs = SimdF32::select(mask_z, SimdF32::TINY, directions.zs);
-
-        let inverse_dirs = Packed_Vec3_x4 {
-            xs: dxs.recip(),
-            ys: dys.recip(),
-            zs: dzs.recip(),
-        };
-
-        Self {
-            origins,
-            directions,
-            inverse_dirs,
-        }
-    }
-
+    /// point along every ray at distance t
     #[inline(always)]
     pub fn at(&self, t: SimdF32) -> Packed_Vec3_x4 {
-        self.directions
-            .mul_then_add(Packed_Vec3_x4::stretched(t), self.origins)
+        self.origins.add_scaled(self.directions, t)
     }
 }
 
@@ -202,44 +130,16 @@ impl PacketBuilder {
     }
 
     /// yields the 2x2 ray packet from the top left pixel
+    #[inline(always)]
     pub fn make(&self, pixel00: Vec3) -> Packet {
         let stretched = Packed_Vec3_x4::from_single(pixel00);
 
-        let xs = stretched.xs + self.builder.xs;
-        let ys = stretched.ys + self.builder.ys;
-        let zs = stretched.zs + self.builder.zs;
-
-        let directions = Packed_Vec3_x4 { xs, ys, zs };
-
-        let length_squared = xs.mul_then_add(xs, ys.mul_then_add(ys, SimdF32::mul(zs, zs)));
-
-        let inv_length = length_squared.inv_sqrt();
-
         let directions = Packed_Vec3_x4 {
-            xs: xs * inv_length,
-            ys: ys * inv_length,
-            zs: zs * inv_length,
+            xs: stretched.xs + self.builder.xs,
+            ys: stretched.ys + self.builder.ys,
+            zs: stretched.zs + self.builder.zs,
         };
 
-        let mask_x = directions.xs.is_eq_to(SimdF32::ZEROES);
-        let dxs = SimdF32::select(mask_x, SimdF32::TINY, directions.xs);
-
-        let mask_y = directions.ys.is_eq_to(SimdF32::ZEROES);
-        let dys = SimdF32::select(mask_y, SimdF32::TINY, directions.ys);
-
-        let mask_z = directions.zs.is_eq_to(SimdF32::ZEROES);
-        let dzs = SimdF32::select(mask_z, SimdF32::TINY, directions.zs);
-
-        let inverse_dirs = Packed_Vec3_x4 {
-            xs: dxs.recip(),
-            ys: dys.recip(),
-            zs: dzs.recip(),
-        };
-
-        Packet {
-            origins: self.origin,
-            directions,
-            inverse_dirs,
-        }
+        Packet::new(self.origin, directions.normalize())
     }
 }

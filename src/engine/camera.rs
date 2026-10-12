@@ -97,9 +97,9 @@ impl Camera {
 
         self.up = self.front.cross(self.right).normalize();
 
-        self.pitch = self.front.y.asin();
+        self.pitch = self.front[1].asin();
 
-        self.yaw = self.front.x.atan2(self.front.z);
+        self.yaw = self.front[0].atan2(self.front[2]);
 
         self.update_viewport();
     }

@@ -31,7 +31,7 @@ impl SimdU32 {
         unsafe {
             let mut a = [0u32; 4];
             vst1q_u32(a.as_mut_ptr(), self.data);
-            return a;
+            a
         }
     }
 
@@ -42,13 +42,13 @@ impl SimdU32 {
 
     /// logical right shift
     #[inline(always)]
-    pub fn shrl<const shamt: i32>(self) -> Self {
-        unsafe { vshrq_n_u32::<shamt>(self.data).into() }
+    pub fn shrl<const SHAMT: i32>(self) -> Self {
+        unsafe { vshrq_n_u32::<SHAMT>(self.data).into() }
     }
     /// logical left shift
     #[inline(always)]
-    pub fn shll<const shamt: i32>(self) -> Self {
-        unsafe { vshlq_n_u32::<shamt>(self.data).into() }
+    pub fn shll<const SHAMT: i32>(self) -> Self {
+        unsafe { vshlq_n_u32::<SHAMT>(self.data).into() }
     }
     /// logical left shift based on variable
     #[inline(always)]
@@ -64,6 +64,23 @@ impl SimdU32 {
     #[inline(always)]
     pub fn or(self, other: Self) -> Self {
         unsafe { vorrq_u32(self.data, other.data).into() }
+    }
+    /// logical xor
+    #[inline(always)]
+    pub fn xor(self, other: Self) -> Self {
+        unsafe { veorq_u32(self.data, other.data).into() }
+    }
+    /// wrapping multiply, keeps the low 32 bits
+    #[inline(always)]
+    pub fn mul(self, other: Self) -> Self {
+        unsafe { vmulq_u32(self.data, other.data).into() }
+    }
+
+    /// top 24 bits as a float in [0, 1), used to turn hashes into random numbers
+    #[inline(always)]
+    pub fn to_f32_unit(self) -> SimdF32 {
+        const INV_2_24: f32 = 1.0 / 16_777_216.0;
+        unsafe { vmulq_n_f32(vcvtq_f32_u32(vshrq_n_u32::<8>(self.data)), INV_2_24).into() }
     }
 
     /// greater than or equal
@@ -88,6 +105,17 @@ impl SimdU32 {
         }
     }
 
+    /// number of leading zero bits per lane
+    #[inline(always)]
+    pub fn leading_zeros(self) -> Self {
+        unsafe { vclzq_u32(self.data).into() }
+    }
+
+    #[inline(always)]
+    pub fn reinterpret_as_i32(self) -> SimdI32 {
+        unsafe { vreinterpretq_s32_u32(self.data).into() }
+    }
+
     /// not
     #[inline(always)]
     pub fn not(self) -> Self {
@@ -110,6 +138,12 @@ impl SimdU32 {
     #[inline(always)]
     pub fn select(self, true_: Self, false_: Self) -> Self {
         unsafe { vbslq_u32(self.data, true_.data, false_.data).into() }
+    }
+
+    /// select -> cond ? true : false, same argument order as SimdF32::select
+    #[inline(always)]
+    pub fn select_bits(condition_mask: Self, if_true: Self, if_false: Self) -> Self {
+        condition_mask.select(if_true, if_false)
     }
 
     #[inline(always)]

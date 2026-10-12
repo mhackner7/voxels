@@ -2,9 +2,7 @@ use std::arch::aarch64::*;
 
 use crate::simd::arm::{simdi32::SimdI32, simdu32::SimdU32};
 
-use std::ops::{
-    Add, AddAssign, Div, DivAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign,
-};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 #[repr(C)]
 #[repr(align(16))] // just in case manually align to 16 bytes (or 128 bits)
@@ -36,7 +34,7 @@ impl SimdF32 {
     pub const fn from_float(value: f32) -> Self {
         unsafe {
             SimdF32 {
-                data: std::mem::transmute([value; 4]),
+                data: std::mem::transmute::<[f32; 4], float32x4_t>([value; 4]),
             }
         }
     }
@@ -46,8 +44,13 @@ impl SimdF32 {
         unsafe {
             let mut a = [0.0f32; 4];
             vst1q_f32(a.as_mut_ptr(), self.data);
-            return a;
+            a
         }
+    }
+
+    #[inline(always)]
+    pub fn div(self, other: Self) -> Self {
+        unsafe { vdivq_f32(self.data, other.data).into() }
     }
 
     #[inline(always)]
@@ -146,6 +149,12 @@ impl SimdF32 {
         unsafe { vcvtq_s32_f32(self.data).into() }
     }
 
+    /// floor and convert in one instruction
+    #[inline(always)]
+    pub fn floor_to_i32(self) -> SimdI32 {
+        unsafe { vcvtmq_s32_f32(self.data).into() }
+    }
+
     #[inline(always)]
     pub fn floor(self) -> Self {
         unsafe { vrndmq_f32(self.data).into() }
@@ -183,11 +192,40 @@ impl SimdF32 {
     #[inline(always)]
     /// get the sign values as 1.0 for positive and -1.0 for negative
     pub fn signs(self) -> Self {
-        static NEGS: SimdF32 = SimdF32::from_float(-1.0f32);
-
-        static ONES: SimdF32 = SimdF32::from_float(1.0f32);
         let mask = self.is_greater_or_equal(Self::ZEROES);
-        Self::select(mask, ONES, NEGS)
+        Self::select(mask, Self::ONES, Self::NEGS)
+    }
+
+    #[inline(always)]
+    pub fn sqrt(self) -> Self {
+        unsafe { vsqrtq_f32(self.data).into() }
+    }
+
+    /// sine and cosine of an angle in [-pi, pi]
+    /// parabola fit with one refinement, max error ~0.001, good enough for sampling
+    #[inline(always)]
+    pub fn sin_cos(self) -> (Self, Self) {
+        use std::f32::consts::{FRAC_PI_2, PI, TAU};
+
+        const B: f32 = 4.0 / PI;
+        const C: f32 = -4.0 / (PI * PI);
+        const P: f32 = 0.225;
+
+        let sin = |x: Self| {
+            let y = Self::from_float(B).mul_then_add(x, Self::from_float(C) * x * x.abs());
+            Self::from_float(P).mul_then_add(y * y.abs() - y, y)
+        };
+
+        // cos(x) = sin(x + pi/2), wrapped back into [-pi, pi] //
+
+        let shifted = self + Self::from_float(FRAC_PI_2);
+        let wrapped = Self::select(
+            shifted.is_greater_than(Self::from_float(PI)),
+            shifted - Self::from_float(TAU),
+            shifted,
+        );
+
+        (sin(self), sin(wrapped))
     }
 
     #[inline(always)]
@@ -262,6 +300,14 @@ impl Mul<SimdF32> for SimdF32 {
     #[inline(always)]
     fn mul(self, rhs: SimdF32) -> Self::Output {
         unsafe { vmulq_f32(self.data, rhs.data).into() }
+    }
+}
+
+impl Div<SimdF32> for SimdF32 {
+    type Output = Self;
+    #[inline(always)]
+    fn div(self, rhs: SimdF32) -> Self::Output {
+        unsafe { vdivq_f32(self.data, rhs.data).into() }
     }
 }
 
