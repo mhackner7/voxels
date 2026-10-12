@@ -70,6 +70,5 @@ the world is 256m x 256m x 256m made of 0.125m voxels, so 2048³ voxels (about 8
 near the ground the camera rays alone are most of the frame now, so thats the next thing to fix
 
 
-Demo of small volume (old version):
-
-https://youtu.be/yy-teP9txk4
+Demo of small world, single tree nothing large
+https://youtu.be/vSuljAd1s0o
