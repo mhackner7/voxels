@@ -220,7 +220,7 @@ impl Tree64 {
            chebyshev and every pass only looks SKIP_MAX meters each way
     */
 
-    fn build_skip(&self) -> Vec<[u8; 2]> {
+    pub(crate) fn build_skip(&self) -> Vec<[u8; 2]> {
         let wet = Self::chebyshev(|meter| self.meter_occupied(meter, false));
         let dry = Self::chebyshev(|meter| self.meter_occupied(meter, true));
 
@@ -317,11 +317,6 @@ impl Tree64 {
         terrain.trees_near(min, scratch);
 
         let mut leaf = Leaf { voxels: [0u64; 8] };
-        let mut blocks = [0u64; 2];
-
-        // the highest voxel of every block (and highest non water one) is how it looks from afar //
-        let mut tops = [(-1i32, Material::Air); 64];
-        let mut dry_tops = [(-1i32, Material::Air); 64];
         let mut brick = Brick::EMPTY;
         let mut stone = 0;
         let mut water = 0;
@@ -338,21 +333,6 @@ impl Tree64 {
                     let index = (x | (y << 3) | (z << 6)) as usize;
                     brick.set(index, material);
                     leaf.voxels[index >> 6] |= 1u64 << (index & 63);
-                    let block_index = ((x >> 1) | ((y >> 1) << 2) | ((z >> 1) << 4)) as usize;
-                    let block = 1u64 << block_index;
-                    blocks[0] |= block;
-
-                    if y as i32 >= tops[block_index].0 {
-                        tops[block_index] = (y as i32, material);
-                    }
-
-                    if material != Material::Water {
-                        blocks[1] |= block;
-
-                        if y as i32 >= dry_tops[block_index].0 {
-                            dry_tops[block_index] = (y as i32, material);
-                        }
-                    }
 
                     stone += (material == Material::Stone) as usize;
                     water += (material == Material::Water) as usize;
@@ -380,17 +360,64 @@ impl Tree64 {
             self.water_leaves.push(0);
         }
 
-        if water != 0 {
-            self.water_leaves[index >> 6] |= 1 << (index & 63);
-        }
-
         self.leaves.push(leaf);
-        self.leaf_blocks.push(blocks);
-        self.leaf_block_materials.push(std::array::from_fn(|b| {
-            tops[b].1 as u8 | ((dry_tops[b].1 as u8) << 4)
-        }));
         self.bricks.push(brick);
+        self.leaf_blocks.push([0; 2]);
+        self.leaf_block_materials.push([0; 64]);
+        self.refresh_leaf(index);
 
         Cell::Mixed(Branch::EMPTY)
+    }
+
+    /// redo everything that's derived from a leaf's voxels: which 2x2x2 blocks have
+    /// anything in them, what each block looks like from afar, and its water bit
+    pub fn refresh_leaf(&mut self, index: usize) {
+        let leaf = &self.leaves[index];
+        let brick = &self.bricks[index];
+        let mut blocks = [0u64; 2];
+
+        // the highest voxel of every block (and highest non water one) is how it looks from afar //
+        let mut tops = [(-1i32, Material::Air); 64];
+        let mut dry_tops = [(-1i32, Material::Air); 64];
+        let mut wet = false;
+
+        for voxel in 0..Leaf::VOXEL_COUNT {
+            if (leaf.voxels[voxel >> 6] >> (voxel & 63)) & 1 == 0 {
+                continue;
+            }
+
+            let material = brick.get(voxel);
+            let (x, y, z) = (voxel & 7, (voxel >> 3) & 7, voxel >> 6);
+            let block_index = (x >> 1) | ((y >> 1) << 2) | ((z >> 1) << 4);
+            let block = 1u64 << block_index;
+            blocks[0] |= block;
+
+            if y as i32 >= tops[block_index].0 {
+                tops[block_index] = (y as i32, material);
+            }
+
+            if material == Material::Water {
+                wet = true;
+                continue;
+            }
+
+            blocks[1] |= block;
+
+            if y as i32 >= dry_tops[block_index].0 {
+                dry_tops[block_index] = (y as i32, material);
+            }
+        }
+
+        self.leaf_blocks[index] = blocks;
+        self.leaf_block_materials[index] =
+            std::array::from_fn(|b| tops[b].1 as u8 | ((dry_tops[b].1 as u8) << 4));
+
+        let bit = 1u64 << (index & 63);
+
+        if wet {
+            self.water_leaves[index >> 6] |= bit;
+        } else {
+            self.water_leaves[index >> 6] &= !bit;
+        }
     }
 }

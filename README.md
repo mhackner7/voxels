@@ -15,6 +15,7 @@ the world is 256m x 256m x 256m made of 0.125m voxels, so 2048³ voxels (about 8
 - realistic terrain test   DONE-ish (hills, rounded mountains, lakes, rivers, trees, snow up top)
 - collision + walking around   DONE
 - dev menu + debug overlays   DONE
+- breaking + placing voxels   DONE (1 voxel up to a 1m ball)
 - solid 30fps at 720p near the ground   not yet, getting there
 - bigger world (1km+)   later
 
@@ -54,11 +55,21 @@ the world is 256m x 256m x 256m made of 0.125m voxels, so 2048³ voxels (about 8
 - rivers come from flow accumulation and only exist where the ground is gentle enough to hold them
 - trees are just shapes until a leaf actually needs them
 
+### editing
+- the tree is packed tight for tracing (siblings sit side by side), so giving a branch a new child copies its whole family to the end of the pool with the new one slotted in. a family thats already at the end just grows in place
+- solid / water cells get split open into children just as full as they were, all the way down to a leaf
+- the skip map only ever shrinks around new stuff, breaking things leaves it alone since too small is still correct, rays just take a couple extra steps
+- holes dug next to or under water flood (from above or the side, never upwards)
+- an edit takes well under a millisecond even at the biggest brush
+
 
 # controls
 - wasd move, mouse look, shift sprint
 - space up / c down while flying, flying speeds up the longer you hold a direction
 - double tap space to switch between flying and walking (gravity, jumping, swimming)
+- left click breaks, right click places, hold either to keep going
+- scroll grows / shrinks the brush, 1 voxel up to an 8 voxel (1m) ball, the ground under it lights up so you can see how big it is
+- arrow keys cycle what's in hand, middle click picks up whatever you're looking at
 - 1 debug overlay, 2 performance overlay (cpu, ram, frame graph), 3 dev menu (w/s pick, a/d change, 3 or esc to close)
 - 0 fullscreen (render resolution stays the same, the gpu just stretches it)
 

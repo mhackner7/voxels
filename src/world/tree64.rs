@@ -936,8 +936,10 @@ mod tests {
     }
 
     /// run every flavor of trace against the reference, returns mismatches
-    fn compare<const ANY_HIT: bool, const SKIP_WATER: bool>(tree: &Tree64) -> usize {
-        let rays = test_rays();
+    fn compare<const ANY_HIT: bool, const SKIP_WATER: bool>(
+        tree: &Tree64,
+        rays: &[(Vec3, Vec3)],
+    ) -> usize {
         let mut mismatches = 0;
 
         for chunk in rays.chunks(4) {
@@ -1012,11 +1014,12 @@ mod tests {
     #[test]
     fn test_trace_matches_reference() {
         let tree = Tree64::build(1337);
+        let rays = test_rays();
 
-        let mismatches = compare::<false, false>(&tree)
-            + compare::<false, true>(&tree)
-            + compare::<true, true>(&tree)
-            + compare::<true, false>(&tree);
+        let mismatches = compare::<false, false>(&tree, &rays)
+            + compare::<false, true>(&tree, &rays)
+            + compare::<true, true>(&tree, &rays)
+            + compare::<true, false>(&tree, &rays);
 
         assert_eq!(mismatches, 0);
     }
@@ -1093,6 +1096,152 @@ mod tests {
         }
 
         assert!(checked > 100);
+    }
+
+    #[test]
+    fn test_edits() {
+        use crate::world::World;
+        use crate::world::sun::Sun;
+
+        let mut world = World {
+            tree: Tree64::build(1337),
+            sun: Sun::default(),
+        };
+
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+
+        let materials = [
+            Material::Dirt,
+            Material::Grass,
+            Material::Stone,
+            Material::Wood,
+            Material::Leaves,
+            Material::Snow,
+            Material::Water,
+        ];
+
+        // surface spots under random rays, plus deep inside solid stone and up in the open sky //
+
+        let mut brushes = Vec::new();
+
+        for _ in 0..600 {
+            let o = Vec3::new(rand() * 256.0, 200.0, rand() * 256.0);
+            let d = Vec3::new(rand() - 0.5, -2.0, rand() - 0.5).normalize();
+
+            if let Some(target) = world.raycast(o, d, 250.0) {
+                let diameter = 1 + (rand() * 8.0) as u32 % 8;
+                let place = rand() < 0.5;
+                let material = if place {
+                    materials[(rand() * 7.0) as usize % 7]
+                } else {
+                    Material::Air
+                };
+
+                brushes.push((
+                    World::brush_center(&target, diameter, place),
+                    diameter,
+                    material,
+                ));
+            }
+        }
+
+        brushes.push((Vec3::new(1024.0, 16.0, 1024.0), 8, Material::Air));
+        brushes.push((Vec3::new(800.0, 1840.0, 800.0), 4, Material::Wood));
+
+        // every voxel around each brush ends up exactly how the brush says //
+
+        let mut rays = test_rays();
+
+        for &(center, diameter, material) in &brushes {
+            let carve = material == Material::Air;
+            let lo = [0, 1, 2].map(|a| center[a].floor() as i32 - 5);
+
+            let mut before = Vec::new();
+            for z in lo[2]..lo[2] + 11 {
+                for y in lo[1]..lo[1] + 11 {
+                    for x in lo[0]..lo[0] + 11 {
+                        before.push(([x, y, z], world.voxel([x, y, z])));
+                    }
+                }
+            }
+
+            world.edit(center, diameter, material, None);
+
+            for (voxel, old) in before {
+                let now = world.voxel(voxel);
+                let old_material = old.unwrap_or(Material::Air);
+                let open = old_material == Material::Air || old_material == Material::Water;
+                let inside = World::in_brush(voxel, center, diameter)
+                    && voxel
+                        .iter()
+                        .all(|&c| (0..Tree64::VOXELS_PER_AXIS).contains(&c));
+
+                let ok = match (inside, carve, open) {
+                    (true, true, false) => now.is_none() || now == Some(Material::Water),
+                    (true, false, true) => now == Some(material),
+                    _ => now == old,
+                };
+
+                assert!(
+                    ok,
+                    "{voxel:?} was {old:?} now {now:?}, brush {center:?} {diameter} {material:?}"
+                );
+            }
+
+            // rays straight at the edit, from above, sideways and from its center. //
+            // directions stay off the lattice, the center is a voxel center / corner
+            // and an exact tie there can go either (valid) way
+
+            let m = center * VOXEL_SIZE;
+            let dirs = [
+                Vec3::new(0.0113, -1.0, 0.0217),
+                Vec3::new(1.0, -0.0531, 0.0347),
+                Vec3::new(0.3119, 0.2063, 1.0),
+            ];
+
+            rays.push((m + Vec3::new(0.03, 20.0, 0.07), dirs[0].normalize()));
+            rays.push((m + Vec3::new(-3.0, 0.02, 0.01), dirs[1].normalize()));
+            rays.push((m, dirs[2].normalize()));
+        }
+
+        // the sky ball sticks out above the old terrain top, rays still find it //
+
+        let packet = Packet::from_vecs(
+            [Vec3::new(100.06, 250.0, 100.06); 4],
+            [Vec3::new(0.0, -1.0, 0.0); 4],
+        );
+        let hit = primary(&world.tree, packet);
+        assert_eq!(hit.materials[0], Material::Wood);
+        assert!((hit.distances.to_array()[0] - 19.75).abs() < 1e-3);
+
+        // the traversal (leaf summaries, skip map, top bound) agrees with the plain walk //
+
+        let mismatches = compare::<false, false>(&world.tree, &rays)
+            + compare::<false, true>(&world.tree, &rays)
+            + compare::<true, true>(&world.tree, &rays)
+            + compare::<true, false>(&world.tree, &rays);
+
+        assert_eq!(mismatches, 0);
+
+        // the skip map is never bigger than a fresh one, too small is fine //
+
+        let fresh = world.tree.build_skip();
+        let over = (0..fresh.len())
+            .filter(|&i| (0..2).any(|k| world.tree.skip[i][k] > fresh[i][k]))
+            .count();
+
+        println!(
+            "{} edits, {} leaves",
+            brushes.len(),
+            world.tree.leaves.len()
+        );
+        assert_eq!(over, 0);
     }
 
     #[test]

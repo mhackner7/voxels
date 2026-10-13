@@ -93,6 +93,8 @@ pub enum PlayerCommands {
     Interact,
     Select,
     Inventory,
+    BrushGrow,
+    BrushShrink,
     _COUNT,
 }
 
@@ -150,6 +152,8 @@ impl From<Command> for &'static str {
                 PlayerCommands::Interact => "Interact",
                 PlayerCommands::Select => "Select",
                 PlayerCommands::Inventory => "Inventory",
+                PlayerCommands::BrushGrow => "BrushGrow",
+                PlayerCommands::BrushShrink => "BrushShrink",
                 PlayerCommands::_COUNT => "Entity::_COUNT",
             },
             Command::Camera(cmd) => match cmd {

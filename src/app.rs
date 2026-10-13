@@ -3,7 +3,7 @@ use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::error::EventLoopError;
-use winit::event::WindowEvent;
+use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
@@ -181,13 +181,22 @@ impl ApplicationHandler for App<'_> {
                 button,
             } => self.engine.input.push(button.into(), state.into()),
             WindowEvent::MouseWheel {
-                device_id,
+                device_id: _,
                 delta,
-                phase,
+                phase: _,
             } => {
-                self.engine
-                    .input
-                    .push(delta.into(), crate::engine::input::util::State::Pressed);
+                // trackpads send zero deltas when a scroll ends, those would count as up //
+
+                let still = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y == 0.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y == 0.0,
+                };
+
+                if !still {
+                    self.engine
+                        .input
+                        .push(delta.into(), crate::engine::input::util::State::Pressed);
+                }
             }
             _ => (),
         }

@@ -3,6 +3,7 @@ use crate::world::tree64::Tree64;
 
 pub mod build;
 pub mod collision;
+pub mod edit;
 pub mod leaf;
 pub mod sun;
 pub mod terrain;

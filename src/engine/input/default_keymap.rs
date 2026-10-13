@@ -29,6 +29,10 @@ impl std::default::Default for crate::engine::input::keymap::KeyMap {
         keycodes_from_commands[i] = KBMcode::MouseMiddle;
         i = Command::Player(PlayerCommands::Inventory).index();
         keycodes_from_commands[i] = KBMcode::KeyE;
+        i = Command::Player(PlayerCommands::BrushGrow).index();
+        keycodes_from_commands[i] = KBMcode::MouseScrollUp;
+        i = Command::Player(PlayerCommands::BrushShrink).index();
+        keycodes_from_commands[i] = KBMcode::MouseScrollDown;
 
         // Camera Commands
         i = Command::Camera(CameraCommands::ZoomIn).index();
@@ -39,8 +43,9 @@ impl std::default::Default for crate::engine::input::keymap::KeyMap {
         keycodes_from_commands[i] = KBMcode::F5;
 
         // Inventory Commands
+        // (not on MouseLeft, a key only maps to one command and that one breaks stuff)
         i = Command::Inventory(InventoryCommands::Select).index();
-        keycodes_from_commands[i] = KBMcode::MouseLeft;
+        keycodes_from_commands[i] = KBMcode::Enter;
         i = Command::Inventory(InventoryCommands::Next).index();
         keycodes_from_commands[i] = KBMcode::ArrowRight;
         i = Command::Inventory(InventoryCommands::Back).index();

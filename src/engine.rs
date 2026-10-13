@@ -8,6 +8,7 @@ pub mod usage;
 
 use crate::math::vec3::Vec3;
 use crate::world::World;
+use crate::world::edit::Target;
 use camera::Camera;
 use input::handler::Handler;
 use player::Player;
@@ -80,6 +81,8 @@ pub struct Engine {
     pub input: Handler,
     pub player: Player,
     pub world: World,
+    /// the voxel under the crosshair (within reach), None = nothing to edit
+    pub target: Option<Target>,
 }
 
 impl Engine {
@@ -181,6 +184,7 @@ impl Engine {
             history_valid: false,
             frame_accumulation_count: 0,
             frame_index: 0,
+            target: None,
         }
     }
 

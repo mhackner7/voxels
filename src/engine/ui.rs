@@ -7,6 +7,7 @@ use crate::simd::simdu32::SimdU32;
 use crate::world::leaf::{Brick, Leaf};
 use crate::world::tree64::Branch;
 use crate::world::voxel::*;
+use rayon::slice::ParallelSliceMut;
 use std::fmt::Write;
 
 /*
@@ -14,6 +15,7 @@ use std::fmt::Write;
 
     gets drawn straight into the pixel buffer after the render, and scales up with the render rows
     1 = debug overlay, 2 = performance overlay, 3 = dev menu (W/S pick, A/D change, 3 / esc close)
+    the hud (crosshair, brush, what's in hand) is always up
     all the text gets formatted on the stack, so nothing allocates per frame
 */
 
@@ -21,6 +23,8 @@ use std::fmt::Write;
 pub const FRAME_HISTORY: usize = 120;
 
 pub struct Ui {
+    /// crosshair, the brush preview and what's in hand, on unless the menu is open
+    pub hud: bool,
     /// 1: where you are, where you're looking, what you're looking at
     pub overlay: bool,
     /// 2: frame times, cpu, ram and tree stats
@@ -40,6 +44,7 @@ pub struct Ui {
 impl Ui {
     pub const fn new() -> Self {
         Self {
+            hud: true,
             overlay: false,
             perf: false,
             menu: false,
@@ -52,7 +57,7 @@ impl Ui {
 
     #[inline(always)]
     pub fn visible(&self) -> bool {
-        self.overlay || self.perf || self.menu
+        self.hud || self.overlay || self.perf || self.menu
     }
 
     /// one more frame time for the graph (ms)
@@ -416,7 +421,29 @@ impl Engine {
             lines.push(GREY, format_args!("1 DEBUG  2 PERF  3 MENU"));
 
             draw_lines(pixels, width, 2, 2, &lines, scale);
+        }
+
+        /* HUD */
+
+        if self.ui.hud && !self.ui.menu {
+            self.draw_brush(pixels);
             draw_crosshair(pixels, width, height, scale);
+
+            let mut lines = Lines::new();
+            lines.push(
+                WHITE,
+                format_args!("{:?}  BRUSH {}", self.player.hand, self.player.brush),
+            );
+
+            let (panel_width, panel_height) = lines.size();
+            draw_lines(
+                pixels,
+                width,
+                (width - panel_width * scale) / 2,
+                height.saturating_sub((panel_height + 4) * scale),
+                &lines,
+                scale,
+            );
         }
 
         /* PERFORMANCE OVERLAY */
@@ -547,6 +574,55 @@ impl Engine {
                 scale,
             );
         }
+    }
+}
+
+impl Engine {
+    /// lighten every pixel whose voxel a break would take, so the brush size shows right
+    /// on the ground. the pixel's voxel comes back out of its depth and face, no tracing
+    fn draw_brush(&self, pixels: &mut [u32]) {
+        let Some(target) = self.target else {
+            return;
+        };
+
+        let brush = self.player.brush;
+        let center = World::brush_center(&target, brush, false);
+        let camera = &self.camera;
+        let width = self.render_width;
+
+        pixels
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let row_ray = camera.pixel_00 - camera.pixel_delta_y * y as f32 - camera.center;
+
+                for (x, pixel) in row.iter_mut().enumerate() {
+                    let face = self.frame_faces[y * width + x];
+
+                    if face as usize >= 6 {
+                        continue;
+                    }
+
+                    // a ray is one unit along front per unit of depth, so depth scales it //
+                    // right onto the face, then half a voxel back in lands inside the voxel
+
+                    let ray = row_ray + camera.pixel_delta_x * x as f32;
+                    let mut p =
+                        (camera.center + ray * self.frame_depths[y * width + x]) * VOXELS_PER_METER;
+
+                    let axis = face as usize / 2;
+                    p[axis] += if face & 1 == 1 { -0.5 } else { 0.5 };
+
+                    let voxel = [0, 1, 2].map(|a| p[a].floor() as i32);
+
+                    if World::in_brush(voxel, center, brush) {
+                        // 30% of the way to white //
+                        let [r, g, b, _] = pixel.to_le_bytes();
+                        let lift = |c: u8| c + (((255 - c) as u32 * 77) >> 8) as u8;
+                        *pixel = u32::from_le_bytes([lift(r), lift(g), lift(b), 255]);
+                    }
+                }
+            });
     }
 }
 
