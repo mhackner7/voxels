@@ -31,8 +31,8 @@ pub const SURFACE_OFFSET: f32 = 1e-3;
 /// how far you can see through water (meters), anything deeper is just water color
 pub const WATER_VISIBILITY: f32 = 6.0;
 
-/// reflections off water give up here (meters), past that they just show sky
-pub const WATER_REFLECTION_DISTANCE: f32 = 96.0;
+/// reflection rays off water give up here (meters), past that they just show sky
+pub const WATER_REFLECTION_DISTANCE: f32 = 32.0;
 
 #[inline(always)]
 pub fn splat(v: Vec3) -> Packed_Vec3_x4 {

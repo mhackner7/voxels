@@ -35,19 +35,24 @@ the world is 256m x 256m x 256m made of 0.125m voxels, so 2048³ voxels (about 8
 - the screen is cut into 16x16 tiles walked in morton order and spread across every core with rayon, tiles never overlap so no locks
 - traversal keeps an ancestor stack, the highest bit that changed on a step says how far back up the tree to go
 - empty 2x2x2 groups of cells get stepped over as one bigger cell, and rays in the same packet that land in the same cell just share the answer instead of walking the tree again. both of those came from reading [dubiousconst282's 64-tree write up](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/)
-- lod: once a ray is wider than a 2x2x2 block it just hits the block as a whole, shadow rays do it with any cell
+- lod ladder: full res up to 32m, then rays hit 2x2x2 voxel blocks as a whole, 4x4x4 from 64m and a whole 8x8x8 meter from 128m. a lumped block looks like the material of its highest voxel. shadow rays lump any cell no wider than them
 
-### lighting
-- sun is a square light you can move from the dev menu, low sun gets dimmer and redder
-- every pixel gets a sun shadow ray plus one bounce (with its own shadow ray), it accumulates up to 512 samples while you stand still
+### lighting (voxel lighting)
+- light gets stored per voxel face in the world, not per pixel. every pixel looking at a face just reads its light, so a whole voxel side is one flat color and up close it looks properly voxel-y
+- the faces live in one big hash table (2 million faces, 64mb), the first lane that sees a face each frame decides if it needs shading, nobody else touches it. no locks, just atomics
+- the light patches follow the same lod ladder: every face has its own light up to 32m, then 2x2 / 4x4 / 8x8 voxel patches at 32 / 64 / 128m
+- a face sample is a sun shadow ray from a random spot on the face plus one bounce. if the bounce hits a face thats already in the cache it just borrows its light, so every bounce after the first is free
+- new faces get 4 samples right away, young ones get shaded every frame, settled ones only every so often (the frame budget decides how often)
+- sun is a square light you can move from the dev menu, low sun gets dimmer and redder. moving it forgets every face (costs nothing, it just bumps a generation number)
 - water does a reflection ray and a refraction ray mixed by fresnel, you can see the bottom up to about 6m, deeper is just water color. going under water fogs everything out
+- reflections go 32m, past that they show sky. they show the cached light of whatever they hit
+- water closer than 32m traces a reflection for every pixel, further out only every 2nd / 4th pixel does and the rest blur together the ones around them, blurrier the further out
 
 ### moving without it looking like garbage
-- still frames keep piling up samples, but when you move the old image gets reprojected instead of thrown away
-- every pixel still gets its own camera ray so stuff stays sharp, but the lighting gets reused from last frame if that spot was on screen already. only new spots and a rotating handful of others get re-lit
-- history only holds the light, not the texture, so textures and voxel edges dont smear
-- history only gets reused from the same voxel face at the same depth, so it never leaks across edges
-- the frame budget (60 / 30 / off in the dev menu) decides how much gets re-lit each frame
+- since the light lives in the world, moving the camera doesnt throw any of it away. moving frames look just as clean as still ones, no history, no reprojection, no smearing
+- every pixel still gets its own camera ray so stuff stays sharp
+- standing still the rays get jittered and every pixel keeps a running mean of its color, thats the anti aliasing
+- breaking / placing stuff makes the faces around it young again so the light there catches up in a few frames
 
 ### terrain
 - noise height field with thermal erosion so mountains turn into rounded hills instead of spikes
@@ -87,12 +92,12 @@ cargo test --release
 
 
 # performance (m2 macbook air, 720p, moving)
-- looking down from high up: ~24ms
-- hills near the ground: ~41ms
-- over a lake: ~49ms
-- standing still always fits the budget, it just splits the image into slices and sharpens over a few frames
+- looking down from high up: ~22ms
+- hills near the ground: ~45ms
+- over a lake: ~63ms (near water still traces a reflection + refraction for every pixel every frame)
+- shading the faces is basically free now (a couple % of the frame), its almost all camera rays and water rays
 
-near the ground the camera rays alone are most of the frame now, so thats the next thing to fix
+camera rays are the next thing to fix, thats whats keeping it from 30fps near the ground
 
 
 Demo of small volume (old version):

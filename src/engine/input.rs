@@ -7,7 +7,7 @@ pub mod util;
 
 use crate::engine::input::commands::*;
 use crate::engine::player::GaitState;
-use crate::world::voxel::Material;
+use crate::world::voxel::{Material, VOXELS_PER_METER};
 
 use super::*;
 
@@ -121,7 +121,14 @@ impl Engine {
             (!(player.noclip && player.flying())).then(|| Player::hitbox(player.position));
 
         if self.world.edit(center, player.brush, material, keep_out) {
-            // same as moving: history stays, anything that changed fails the face / depth check //
+            // faces around it (and a meter more for shadows / bounce) go back to being young, //
+            // they re-light over the next few frames, everything else keeps its light
+
+            let reach = player.brush as f32 * 0.5 + VOXELS_PER_METER;
+            let lo = [0, 1, 2].map(|a| (center[a] - reach).floor() as i32);
+            let hi = [0, 1, 2].map(|a| (center[a] + reach).ceil() as i32);
+
+            self.lights.invalidate(lo, hi);
             self.frame_accumulation_count = 0;
             self.target = self
                 .world

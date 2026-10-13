@@ -472,21 +472,19 @@ impl Engine {
             lines.push(
                 WHITE,
                 format_args!(
-                    "RES {}X{}  TARGET {}  MOVING 1/{} {}X  {} SLICES",
-                    width,
-                    height,
-                    FPS_TARGETS[self.fps_target],
-                    Self::MOVING_STEPS[self.moving_step].0,
-                    Self::MOVING_STEPS[self.moving_step].1,
-                    self.still_slices
+                    "RES {}X{}  TARGET {}  REFRESH 1/{}",
+                    width, height, FPS_TARGETS[self.fps_target], self.every
                 ),
             );
             lines.push(
                 WHITE,
                 format_args!(
-                    "SAMPLES {:.0}/{}",
+                    "FRAMES {:.0}/{}  FACES {}K/{}K  LIT {}",
                     self.samples,
-                    Self::MAX_ACCUMULATED_FRAMES
+                    Self::MAX_ACCUMULATED_FRAMES,
+                    self.lights.used.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+                    self.lights.slots() / 1000,
+                    self.faces_lit
                 ),
             );
 

@@ -58,16 +58,6 @@ pub struct PacketHit {
     pub materials: [Material; 4],
 }
 
-impl PacketHit {
-    /// nothing hit on any lane
-    pub const MISS: Self = Self {
-        hit: SimdU32::ALL_INACTIVE,
-        distances: SimdF32::INFY,
-        normals: Packed_Vec3_x4::ZEROES,
-        materials: [Material::Air; 4],
-    };
-}
-
 impl Tree64 {
     /// depth of the leaf level (0.25m blocks), the 4 branch levels (64m, 16m, 4m, 1m cells) sit above it
     /// node_stack[LEAF_DEPTH] holds the index of the current leaf
@@ -379,6 +369,26 @@ impl PacketWalk {
                     let blocks =
                         unsafe { tree.leaf_blocks.get_unchecked(node) }[SKIP_WATER as usize];
 
+                    // the ray is as wide as a whole 4x4x4 group of blocks by now, //
+                    // so any block in it makes the group solid (or the empty group gets hopped)
+
+                    if lod >= 2 {
+                        let base = block & 0b101010;
+                        let in_group = blocks & (GROUP << base);
+
+                        if in_group == 0 {
+                            group = true;
+                            break false;
+                        }
+
+                        if !ANY_HIT {
+                            let summary = unsafe { tree.leaf_block_materials.get_unchecked(node) };
+                            self.materials[i] = top_material(in_group, summary, SKIP_WATER);
+                        }
+
+                        break true;
+                    }
+
                     if (blocks >> block) & 1 == 0 {
                         group = (blocks >> (block & 0b101010)) & GROUP == 0;
                         break false;
@@ -473,9 +483,27 @@ impl PacketWalk {
                 // occupancy masks are compressed, so:
                 // child_pointer + number of set bits before current cell
 
+                let child = branch.child_pointer + (branch.children & (bit - 1)).count_ones();
+
+                // the ray is a whole meter wide by now, a leaf with anything in it is one solid cell //
+                // (a water only leaf is nothing to a ray looking through water, it gets stepped)
+
+                if !ANY_HIT && depth == Tree64::LEAF_DEPTH - 1 && lod >= 3 {
+                    let blocks = unsafe { tree.leaf_blocks.get_unchecked(child as usize) }
+                        [SKIP_WATER as usize];
+
+                    if blocks == 0 {
+                        break false;
+                    }
+
+                    let summary =
+                        unsafe { tree.leaf_block_materials.get_unchecked(child as usize) };
+                    self.materials[i] = top_material(blocks, summary, SKIP_WATER);
+                    break true;
+                }
+
                 unsafe {
-                    *self.node_stack[i].get_unchecked_mut(depth + 1) =
-                        branch.child_pointer + (branch.children & (bit - 1)).count_ones();
+                    *self.node_stack[i].get_unchecked_mut(depth + 1) = child;
                 }
 
                 depth += 1;
@@ -696,6 +724,25 @@ const GROUP: u64 = 0x0033_0033;
 fn lod_shift(footprint: f32) -> i32 {
     // just the exponent bits, so a -0.0 footprint doesn't sneak in through the sign //
     ((footprint.to_bits() >> 23) & 0xFF) as i32 - 127
+}
+
+/// how a lumped bunch of blocks looks from afar: the summary material of its highest block.
+/// blocks = some of one leaf's block bits (never 0), summary = that leaf's leaf_block_materials
+#[inline(always)]
+fn top_material(blocks: u64, summary: &[u8; 64], skip_water: bool) -> Material {
+    // the 16 blocks of one y layer, block index = x | (y << 2) | (z << 4) //
+    const LAYER: u64 = 0x000F_000F_000F_000F;
+
+    let mut y = 3;
+    while y > 0 && blocks & (LAYER << (4 * y)) == 0 {
+        y -= 1;
+    }
+
+    let block = (blocks & (LAYER << (4 * y))).trailing_zeros() as usize;
+    let nibble = (summary[block] >> (4 * skip_water as u8)) & 15;
+
+    // SAFETY: the build only ever writes Material values in here
+    unsafe { std::mem::transmute::<u8, Material>(nibble) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1047,6 +1094,11 @@ mod tests {
 
                 if exact.hit.to_array()[lane] != 0 {
                     assert!(wide.hit.to_array()[lane] != 0);
+                    assert_ne!(
+                        wide.materials[lane],
+                        Material::Air,
+                        "lod hits keep a material"
+                    );
                     assert!(
                         w[lane] <= e[lane] + 1e-3,
                         "lod hit {} past exact {}",
