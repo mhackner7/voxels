@@ -21,7 +21,6 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use rayon::slice::ParallelSlice;
 
 pub struct Engine {
-    pub render_distance: f32, // in terms of voxels NOT chunks
     pub render_width: usize,
     pub render_height: usize,
 
@@ -94,7 +93,8 @@ impl Engine {
     /// render_rows choices of the dev menu, multiples of the tile size
     pub const RENDER_ROWS: [usize; 4] = [352, 528, 720, 1088];
 
-    pub fn new(render_width: usize, render_height: usize) -> Self {
+    /// the world comes in already built (or loaded), see World::load_or_build
+    pub fn new(render_width: usize, render_height: usize, world: World) -> Self {
         println!("[Engine] Initializing render pipeline...");
         println!(
             "[Engine] Framebuffer: {}x{} ({} pixels, Morton tile size: {}x{})",
@@ -134,16 +134,7 @@ impl Engine {
         );
         camera.look_at(look_target);
 
-        let world_start = std::time::Instant::now();
-        println!("[Engine] Initializing Voxel World...");
-        let world = World::new();
-        println!(
-            "[Engine] World initialization finished in {:.2}ms",
-            world_start.elapsed().as_secs_f64() * 1000.0
-        );
-
         Self {
-            render_distance: 256.0,
             render_width,
             render_height,
             last_time: std::time::Instant::now(),
@@ -206,8 +197,6 @@ impl Engine {
         // keys, mouse and the player move //
 
         self.handle_input(delta_time);
-
-        let _ = self.render_distance;
 
         self.world.update(delta_time);
 

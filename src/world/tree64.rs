@@ -115,7 +115,22 @@ impl Tree64 {
         max_ts: SimdF32,
         cone: f32,
     ) -> PacketHit {
-        let mut walk = PacketWalk::begin(self, packet, active, max_ts, cone);
+        self.trace_from::<ANY_HIT, SKIP_WATER>(packet, active, max_ts, cone, 0.0)
+    }
+
+    /// trace, but every lane starts walking at start (meters along the ray) instead of
+    /// where it enters the volume. the caller promises there's nothing to hit before that,
+    /// and that every lane is still inside the volume there (see Engine::beam_start)
+    #[inline(always)]
+    pub fn trace_from<const ANY_HIT: bool, const SKIP_WATER: bool>(
+        &self,
+        packet: Packet,
+        active: SimdU32,
+        max_ts: SimdF32,
+        cone: f32,
+        start: f32,
+    ) -> PacketHit {
+        let mut walk = PacketWalk::begin(self, packet, active, max_ts, cone, start);
 
         // occupancy skips dead lanes, so a packet that starts out empty just falls right through //
 
@@ -221,7 +236,14 @@ struct PacketWalk {
 
 impl PacketWalk {
     #[inline(always)]
-    fn begin(tree: &Tree64, packet: Packet, active: SimdU32, max_ts: SimdF32, cone: f32) -> Self {
+    fn begin(
+        tree: &Tree64,
+        packet: Packet,
+        active: SimdU32,
+        max_ts: SimdF32,
+        cone: f32,
+        start: f32,
+    ) -> Self {
         // split up the packet //
 
         let origins = packet.origins;
@@ -252,7 +274,11 @@ impl PacketWalk {
             to compare boundary distances, so no epsilon nudging is needed
         */
 
-        let ts = SimdF32::select(active, entry_ts, SimdF32::ZEROES);
+        let ts = SimdF32::select(
+            active,
+            entry_ts.max(SimdF32::from_float(start)),
+            SimdF32::ZEROES,
+        );
 
         let vpm = SimdF32::from_float(VOXELS_PER_METER);
         let max_voxel = SimdI32::from(Tree64::VOXELS_PER_AXIS - 1);
@@ -745,6 +771,7 @@ fn top_material(blocks: u64, summary: &[u8; 64], skip_water: bool) -> Material {
     unsafe { std::mem::transmute::<u8, Material>(nibble) }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Branch {
     /// 4x4x4 cells that have a child node (a branch, or a leaf at depth 3)
@@ -760,6 +787,10 @@ pub struct Branch {
     /// index of the first child in the branch or leaf pool
     /// children are contiguous, offset = popcount(children & cells before)
     pub child_pointer: u32,
+
+    /// unused, it's just the 4 bytes that round the node up to 32, spelled out
+    /// so there's no hidden padding when the world cache writes branches out raw
+    pub spare: u32,
 }
 
 impl Branch {
@@ -768,12 +799,14 @@ impl Branch {
         solid: 0,
         water: 0,
         child_pointer: 0,
+        spare: 0,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::World;
     use crate::world::terrain::Terrain;
 
     fn primary(tree: &Tree64, packet: Packet) -> PacketHit {
@@ -1390,7 +1423,7 @@ mod tests {
     #[test]
     fn test_render_one_frame() {
         let (width, height) = (640, 352);
-        let mut engine = crate::engine::Engine::new(width, height);
+        let mut engine = crate::engine::Engine::new(width, height, World::new());
         let mut buffer = vec![0u32; width * height];
 
         engine.frame(buffer.as_mut_ptr() as usize);
@@ -1464,7 +1497,7 @@ mod tests {
         // accumulated views //
 
         let (width, height) = (960, 544);
-        let mut engine = crate::engine::Engine::new(width, height);
+        let mut engine = crate::engine::Engine::new(width, height, World::new());
 
         // whole frames, every one of the 64 renders is a full sample //
         engine.fps_target = 2;

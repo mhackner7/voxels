@@ -9,6 +9,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::engine::Engine;
+use crate::world::World;
 
 pub struct App<'a> {
     window: Option<Arc<Window>>,
@@ -26,7 +27,7 @@ pub struct App<'a> {
 
 impl App<'_> {
     /// render_rows is the fixed render height, the width follows the window aspect
-    pub fn new(width: usize, height: usize, render_rows: usize) -> Self {
+    pub fn new(width: usize, height: usize, render_rows: usize, world: World) -> Self {
         let (render_width, render_height) = render_size(width, height, render_rows);
 
         Self {
@@ -34,7 +35,7 @@ impl App<'_> {
             pixel_buffer: None,
             width,
             height,
-            engine: Engine::new(render_width, render_height),
+            engine: Engine::new(render_width, render_height, world),
         }
     }
 
@@ -176,7 +177,7 @@ impl ApplicationHandler for App<'_> {
                 _ => (),
             },
             WindowEvent::MouseInput {
-                device_id,
+                device_id: _,
                 state,
                 button,
             } => self.engine.input.push(button.into(), state.into()),

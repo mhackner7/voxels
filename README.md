@@ -34,13 +34,14 @@ the world is 256m x 256m x 256m made of 0.125m voxels, so 2048³ voxels (about 8
 - rays go out in packets of 4 using 4 wide simd (arm neon for now, the x86 side is still just stubs so it only runs on apple silicon / arm)
 - the screen is cut into 16x16 tiles walked in morton order and spread across every core with rayon, tiles never overlap so no locks
 - traversal keeps an ancestor stack, the highest bit that changed on a step says how far back up the tree to go
+- camera rays get a head start: every 8x8 pixel block marches its center ray through the skip map, and as long as the whole fan of its rays fits inside the empty cubes it can jump ahead. all 16 packets of the block start from there, saves about a fifth of the frame near the ground
 - empty 2x2x2 groups of cells get stepped over as one bigger cell, and rays in the same packet that land in the same cell just share the answer instead of walking the tree again. both of those came from reading [dubiousconst282's 64-tree write up](https://dubiousconst282.github.io/2024/10/03/voxel-ray-tracing/)
-- lod ladder: full res up to 32m, then rays hit 2x2x2 voxel blocks as a whole, 4x4x4 from 64m and a whole 8x8x8 meter from 128m. a lumped block looks like the material of its highest voxel. shadow rays lump any cell no wider than them
+- lod ladder: full res up to 24m, then rays hit 2x2x2 voxel blocks as a whole, 4x4x4 from 48m and a whole 8x8x8 meter from 96m. a lumped block looks like the material of its highest voxel. shadow rays lump any cell no wider than them
 
 ### lighting (voxel lighting)
 - light gets stored per voxel face in the world, not per pixel. every pixel looking at a face just reads its light, so a whole voxel side is one flat color and up close it looks properly voxel-y
 - the faces live in one big hash table (2 million faces, 64mb), the first lane that sees a face each frame decides if it needs shading, nobody else touches it. no locks, just atomics
-- the light patches follow the same lod ladder: every face has its own light up to 32m, then 2x2 / 4x4 / 8x8 voxel patches at 32 / 64 / 128m
+- the light patches follow the same lod ladder: every face has its own light up to 24m, then 2x2 / 4x4 / 8x8 voxel patches at 24 / 48 / 96m
 - a face sample is a sun shadow ray from a random spot on the face plus one bounce. if the bounce hits a face thats already in the cache it just borrows its light, so every bounce after the first is free
 - new faces get 4 samples right away, young ones get shaded every frame, settled ones only every so often (the frame budget decides how often)
 - sun is a square light you can move from the dev menu, low sun gets dimmer and redder. moving it forgets every face (costs nothing, it just bumps a generation number)
@@ -85,6 +86,12 @@ cargo run --release
 ```
 never run it in debug, it runs at like 0.5 fps
 
+the first run generates the world (~2s) and caches it in `cache/world_42.bin` (~130mb), after that it asks if you want to reuse it, loading takes like 20ms. the cache knows which version of the generator made it, so changing the terrain code just makes it build a new one
+```
+cargo run --release -- --reuse       # use the cache, don't ask
+cargo run --release -- --new-world   # always generate a fresh one
+```
+
 tests (traversal gets checked against a dumb exact reference walk on 13k+ rays, plus lakes, collision and walking):
 ```
 cargo test --release
@@ -92,9 +99,9 @@ cargo test --release
 
 
 # performance (m2 macbook air, 720p, moving)
-- looking down from high up: ~22ms
-- hills near the ground: ~45ms
-- over a lake: ~63ms (near water still traces a reflection + refraction for every pixel every frame)
+- looking down from high up: ~21ms
+- hills near the ground: ~35ms
+- over a lake: ~60ms (near water still traces a reflection + refraction for every pixel every frame)
 - shading the faces is basically free now (a couple % of the frame), its almost all camera rays and water rays
 
 camera rays are the next thing to fix, thats whats keeping it from 30fps near the ground

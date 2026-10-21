@@ -6,7 +6,7 @@ use crate::simd::packetvec::Packed_Vec3_x4;
 use crate::simd::simdf32::SimdF32;
 use crate::simd::simdu32::SimdU32;
 use crate::world::sun::SUN_SIZE;
-use crate::world::tree64::PacketHit;
+use crate::world::tree64::{PacketHit, Tree64};
 use crate::world::voxel::{Material, VOXEL_SIZE, VOXELS_PER_METER};
 
 /// what one packet of camera rays ends up looking at, water already dealt with,
@@ -82,8 +82,14 @@ const TILE: usize = Engine::PIXELS_PER_TILE_AXIS;
 /// packets in a tile (2x2 pixels each)
 const TILE_PACKETS: usize = (TILE / 2) * (TILE / 2);
 
-/// most face samples a tile can need in one frame, every lane on its own new face
-const TILE_JOBS: usize = TILE_PACKETS * 4 * Engine::FIRST_SAMPLES as usize;
+/// packets in one beam block
+const BLOCK_PACKETS: usize = (Engine::BEAM_PIXELS / 2) * (Engine::BEAM_PIXELS / 2);
+
+/// face samples a tile queues up before shading them
+const TILE_JOBS: usize = TILE_PACKETS * 4;
+
+/// most private faces a tile keeps, past that they just get ambient light for a frame
+const TILE_PRIVATES: usize = 64;
 
 impl Engine {
     /// once a still image has this many frames we just stop tracing
@@ -117,13 +123,20 @@ impl Engine {
         camera rays get one voxel wider every LOD_START / 2 meters, so the traversal's
         floor(log2(width)) lands on exactly those steps
     */
-    pub const LOD_START: f32 = 32.0;
+    pub const LOD_START: f32 = 24.0;
     pub const CAMERA_CONE: f32 = 2.0 / Self::LOD_START;
 
     /// far water only traces every nth pixel's reflection (per lod level), every water pixel
     /// out there then blurs together the ones within REFLECTION_BLUR pixels of it
     pub const REFLECTION_STEP: [usize; 4] = [1, 2, 4, 4];
     pub const REFLECTION_BLUR: [usize; 4] = [0, 2, 4, 6];
+
+    /// skip map hops a beam gets at most, and the shortest one still worth a lookup (meters)
+    pub const BEAM_HOPS: usize = 16;
+    pub const BEAM_MIN_HOP: f32 = 0.25;
+
+    /// pixels along one side of a beam block, every packet in it starts at the block's beam_start
+    pub const BEAM_PIXELS: usize = 8;
 
     /// samples a brand new face gets right away, one sample per face looks like confetti
     pub const FIRST_SAMPLES: u32 = 4;
@@ -165,6 +178,8 @@ impl Engine {
             moving: rays go through pixel centers, the image is just this frame
             still: rays get jittered and every pixel keeps a running mean of its color,
             that's the anti aliasing, the faces keep converging underneath it
+
+            every 16x16 tile runs the stages in Tile on its own thread
         */
 
         let moving = self.frame_accumulation_count == 0;
@@ -179,21 +194,7 @@ impl Engine {
 
         self.camera.update();
 
-        // an eye inside water sees everything through it //
-        let underwater = self.world.water_at(self.camera.center);
-
         let budget = Self::FRAME_BUDGETS[self.fps_target];
-        let every = if budget.is_finite() { self.every } else { 1 };
-
-        let camera = self.camera;
-        let width = self.render_width;
-
-        let tile_xcount = width / TILE;
-        let tile_ycount = self.render_height / TILE;
-
-        let max_dim = tile_xcount.max(tile_ycount).next_power_of_two();
-        let total_morton_tiles = max_dim * max_dim;
-
         let frame = self.frame_index;
 
         self.frame_accumulation_count += 1;
@@ -213,435 +214,43 @@ impl Engine {
             )
         };
 
-        let cone = Self::CAMERA_CONE;
+        let camera = self.camera;
 
-        let packet_builder =
-            PacketBuilder::new(camera.center, camera.pixel_delta_x, camera.pixel_delta_y);
+        let setup = Setup {
+            camera,
+            builder: PacketBuilder::new(camera.center, camera.pixel_delta_x, camera.pixel_delta_y),
+            jitter,
+            // an eye inside water sees everything through it
+            underwater: self.world.water_at(camera.center),
+            moving,
+            frame,
+            every: if budget.is_finite() { self.every } else { 1 },
+            width: self.render_width,
+            accumulation: self.frame_accumulation_buffer.as_mut_ptr() as usize,
+            depths: self.frame_depths.as_mut_ptr() as usize,
+            faces: self.frame_faces.as_mut_ptr() as usize,
+            pixels: buffer_address,
+        };
 
-        let accumulation = self.frame_accumulation_buffer.as_mut_ptr() as usize;
-        let depths = self.frame_depths.as_mut_ptr() as usize;
-        let faces = self.frame_faces.as_mut_ptr() as usize;
-        let lights = &self.lights;
+        let tile_xcount = self.render_width / TILE;
+        let tile_ycount = self.render_height / TILE;
+        let max_dim = tile_xcount.max(tile_ycount).next_power_of_two();
 
-        (0..total_morton_tiles)
+        (0..max_dim * max_dim)
             .into_par_iter()
             .filter_map(|i| {
-                let (tile_x, mut tile_y) = morton_decode(i);
-                if tile_x >= tile_xcount || tile_y >= tile_ycount {
-                    return None;
-                }
-                tile_y = tile_ycount - 1 - tile_y;
-                Some((tile_x, tile_y))
+                let (tile_x, tile_y) = morton_decode(i);
+                (tile_x < tile_xcount && tile_y < tile_ycount)
+                    .then(|| (tile_x * TILE, (tile_ycount - 1 - tile_y) * TILE))
             })
-            .for_each(|(tile_x, tile_y)| {
-                // convert tiles to pixel space
-                // corresponds to the top left pixel of the tile
-                let tile_pixel00_x = tile_x * TILE;
-                let tile_pixel00_y = tile_y * TILE;
-
-                /* PRIMARY */
-
-                // every packet's camera rays, what they hit, and the water in front of it //
-
-                let mut views = [View::EMPTY; TILE_PACKETS];
-                let mut corners = [(0usize, 0usize); TILE_PACKETS];
-
-                for k in 0..TILE_PACKETS {
-                    // the top left pixel of the packet, relative to the tile
-                    let (rel_x, rel_y) = morton_to_xy(k);
-
-                    // top left x and y globally
-                    let packet_pixel_x = tile_pixel00_x + rel_x;
-                    let packet_pixel_y = tile_pixel00_y + rel_y;
-                    corners[k] = (packet_pixel_x, packet_pixel_y);
-
-                    // packet top left coord as vec3
-                    let packet00_coord = camera.pixel_00
-                        + (camera.pixel_delta_x * (packet_pixel_x as f32 + jitter.0))
-                        - (camera.pixel_delta_y * (packet_pixel_y as f32 + jitter.1));
-
-                    let packet = packet_builder.make(packet00_coord);
-                    let hit = self.primary(packet, underwater, cone);
-                    views[k] = self.view(packet, hit, underwater, cone);
-
-                    // view depth (along front) and face of every pixel, the brush preview reads them //
-
-                    let ts = hit.distances.to_array();
-                    let dirs = lanes(packet.directions);
-                    let normals = lanes(hit.normals);
-                    let hits = hit.hit.to_array();
-
-                    for lane in 0..4 {
-                        let x = packet_pixel_x + (lane & 1);
-                        let y = packet_pixel_y + (lane >> 1);
-                        let hit = hits[lane] != 0;
-
-                        let depth = if hit {
-                            ts[lane] * Vec3 { data: dirs[lane] }.dot(camera.front)
-                        } else {
-                            f32::INFINITY
-                        };
-
-                        // tiles never overlap, so every pixel is written by one thread
-                        unsafe {
-                            *(depths as *mut f32).add(y * width + x) = depth;
-                            *(faces as *mut u8).add(y * width + x) = face_id(normals[lane], hit);
-                        }
-                    }
-                }
-
-                /* REFLECTIONS */
-
-                // near water traces a reflection for every pixel, further out only every //
-                // REFLECTION_STEP-th pixel does and the rest blur together the ones around them,
-                // blurrier the further out. far pixels with none around (shores) trace their own
-
-                let mut water_levels = [[NO_WATER; TILE]; TILE];
-                let mut reflections = [[[0.0f32; 3]; TILE]; TILE];
-                let mut traced = [[false; TILE]; TILE];
-                let mut mirrors = [(0usize, 0usize); TILE_PACKETS * 4];
-                let mut mirrored = 0;
-
-                let in_tile = |k: usize, lane: usize| {
-                    let (x, y) = corners[k];
-                    (
-                        x + (lane & 1) - tile_pixel00_x,
-                        y + (lane >> 1) - tile_pixel00_y,
-                    )
-                };
-
-                for (k, view) in views.iter().enumerate() {
-                    if view.water.has_none_active() {
-                        continue;
-                    }
-
-                    let water = view.water.to_array();
-                    let origins = lanes(view.mirror_origins);
-
-                    for lane in 0..4 {
-                        if water[lane] == 0 {
-                            continue;
-                        }
-
-                        let (tx, ty) = in_tile(k, lane);
-                        let away = Vec3 {
-                            data: origins[lane],
-                        } - camera.center;
-                        let level = lod_level(away.length()) as usize;
-                        let step = Self::REFLECTION_STEP[level];
-                        water_levels[ty][tx] = level as u8;
-
-                        if tx % step == 0 && ty % step == 0 {
-                            mirrors[mirrored] = (k, lane);
-                            mirrored += 1;
-                        }
-                    }
-                }
-
-                let trace_mirrors =
-                    |queue: &[(usize, usize)],
-                     reflections: &mut [[[f32; 3]; TILE]; TILE],
-                     traced: &mut [[bool; TILE]; TILE]| {
-                        for group in queue.chunks(4) {
-                            let pick = [0, 1, 2, 3].map(|j| group[j.min(group.len() - 1)]);
-                            let origins =
-                                pick.map(|(k, lane)| lanes(views[k].mirror_origins)[lane]);
-                            let dirs = pick.map(|(k, lane)| lanes(views[k].mirror_dirs)[lane]);
-                            let colors = lanes(self.reflect(packed(origins), packed(dirs)));
-
-                            for (j, &(k, lane)) in group.iter().enumerate() {
-                                let (tx, ty) = in_tile(k, lane);
-                                reflections[ty][tx] = colors[j];
-                                traced[ty][tx] = true;
-                            }
-                        }
-                    };
-
-                trace_mirrors(&mirrors[..mirrored], &mut reflections, &mut traced);
-
-                // a far pixel's reflection: the traced ones on its grid within its blur reach, //
-                // weighted by a tent so it fades out smoothly, None if there's none around
-                let gather = |tx: usize,
-                              ty: usize,
-                              reflections: &[[[f32; 3]; TILE]; TILE],
-                              traced: &[[bool; TILE]; TILE]| {
-                    let level = water_levels[ty][tx] as usize;
-                    let (step, reach) =
-                        (Self::REFLECTION_STEP[level], Self::REFLECTION_BLUR[level]);
-                    let grid = |c: usize| {
-                        (c.saturating_sub(reach).div_ceil(step) * step..=(c + reach).min(TILE - 1))
-                            .step_by(step)
-                    };
-                    let mut total = [0.0f32; 3];
-                    let mut weight = 0.0;
-
-                    for gy in grid(ty) {
-                        for gx in grid(tx) {
-                            if !traced[gy][gx] {
-                                continue;
-                            }
-
-                            let w = ((reach + 1 - gx.abs_diff(tx)) * (reach + 1 - gy.abs_diff(ty)))
-                                as f32;
-                            total = [0, 1, 2].map(|c| reflections[gy][gx][c].mul_add(w, total[c]));
-                            weight += w;
-                        }
-                    }
-
-                    (weight > 0.0).then(|| total.map(|c| c / weight))
-                };
-
-                mirrored = 0;
-
-                for k in 0..TILE_PACKETS {
-                    for lane in 0..4 {
-                        let (tx, ty) = in_tile(k, lane);
-                        let level = water_levels[ty][tx];
-
-                        if level != NO_WATER
-                            && level > 0
-                            && !traced[ty][tx]
-                            && gather(tx, ty, &reflections, &traced).is_none()
-                        {
-                            mirrors[mirrored] = (k, lane);
-                            mirrored += 1;
-                        }
-                    }
-                }
-
-                trace_mirrors(&mirrors[..mirrored], &mut reflections, &mut traced);
-
-                // blur into a copy, so every pixel gathers the sharp traced ones //
-
-                let mut blurred = reflections;
-
-                for ty in 0..TILE {
-                    for tx in 0..TILE {
-                        let level = water_levels[ty][tx];
-
-                        if level != NO_WATER
-                            && level > 0
-                            && let Some(blur) = gather(tx, ty, &reflections, &traced)
-                        {
-                            blurred[ty][tx] = blur;
-                        }
-                    }
-                }
-
-                /* FACES */
-
-                // which face (or patch) each lane sees, and who has to shade what. //
-                // neighbors mostly see the same face, those don't even ask
-
-                let mut keys = [[0u64; 4]; TILE_PACKETS];
-                let mut jobs = [Job::EMPTY; TILE_JOBS];
-                let mut queued = 0;
-
-                // faces nobody had light for yet that another tile is busy shading, //
-                // this tile shades them for itself (light sum, samples)
-                let mut privates = [(0u64, [0.0f32; 3], 0.0f32); TILE_PACKETS * 4];
-                let mut private_count = 0;
-
-                // new faces this tile claimed, its own pixels can just wait on those //
-                let mut claimed = [0u64; TILE_PACKETS * 4];
-                let mut claimed_count = 0;
-
-                let mut last = 0u64;
-
-                for k in 0..TILE_PACKETS {
-                    let view = &views[k];
-                    let lit = view.lit.to_array();
-                    let points = lanes(view.points);
-                    let normals = lanes(view.normals);
-                    let distances = view.distances.to_array();
-
-                    for lane in 0..4 {
-                        if lit[lane] == 0 {
-                            continue;
-                        }
-
-                        let (voxel, face) = face_of(points[lane], normals[lane]);
-                        let level = lod_level(distances[lane]);
-                        let key = LightCache::key(voxel, face, level);
-                        keys[k][lane] = key;
-
-                        if key == last {
-                            continue;
-                        }
-                        last = key;
-
-                        let (target, samples) = match lights.claim(key, frame, every) {
-                            Claim::Lit => continue,
-                            Claim::Shade { slot, samples } => {
-                                if samples == 0 {
-                                    claimed[claimed_count] = key;
-                                    claimed_count += 1;
-                                }
-                                (slot, samples)
-                            }
-                            Claim::Missing => {
-                                // ours after all, or already getting its own private light //
-                                if claimed[..claimed_count].contains(&key)
-                                    || privates[..private_count].iter().any(|p| p.0 == key)
-                                {
-                                    continue;
-                                }
-
-                                privates[private_count].0 = key;
-                                private_count += 1;
-                                (PRIVATE | (private_count - 1) as u32, 0)
-                            }
-                        };
-
-                        let (x, y) = corners[k];
-                        let copies = if samples == 0 { Self::FIRST_SAMPLES } else { 1 };
-
-                        for copy in 0..copies {
-                            jobs[queued] = Job {
-                                target,
-                                voxel,
-                                face,
-                                seed: (((y * width + x) * 4 + lane) as u32) * 4 + copy,
-                            };
-                            queued += 1;
-                        }
-                    }
-                }
-
-                /* SHADE FACES */
-
-                // 4 face samples at a time, so no simd lane sits around idle //
-
-                for group in jobs[..queued].chunks(4) {
-                    // short groups just repeat their last job //
-                    let pick = [0, 1, 2, 3].map(|j| group[j.min(group.len() - 1)]);
-
-                    let mut rng = Rng::new(SimdU32::from(pick.map(|job| job.seed)), frame);
-                    let (u1, u2) = (rng.next().to_array(), rng.next().to_array());
-
-                    // a random spot on the face, just off it //
-
-                    let mut starts = [[0.0f32; 3]; 4];
-                    let mut normals = [[0.0f32; 3]; 4];
-
-                    for (j, job) in pick.iter().enumerate() {
-                        let axis = job.face as usize / 2;
-                        let sign = if job.face & 1 == 1 { 1.0 } else { -1.0 };
-                        let mut spot = job.voxel.map(|c| c as f32);
-
-                        spot[axis] += (sign > 0.0) as u32 as f32;
-                        spot[(axis + 1) % 3] += u1[j];
-                        spot[(axis + 2) % 3] += u2[j];
-
-                        normals[j][axis] = sign;
-                        starts[j] = [0, 1, 2]
-                            .map(|a| spot[a].mul_add(VOXEL_SIZE, normals[j][a] * SURFACE_OFFSET));
-                    }
-
-                    let light = lanes(self.face_light(packed(starts), packed(normals), &mut rng));
-
-                    for (j, job) in group.iter().enumerate() {
-                        if job.target & PRIVATE == 0 {
-                            lights.add(job.target, light[j]);
-                        } else {
-                            let private = &mut privates[(job.target & !PRIVATE) as usize];
-                            private.1 = [0, 1, 2].map(|c| private.1[c] + light[j][c]);
-                            private.2 += 1.0;
-                        }
-                    }
-                }
-
-                /* COMPOSE + ACCUMULATE */
-
-                // every pixel's surface times its face light, plus whatever got there //
-                // without touching a lit surface. still frames keep a running mean
-
-                let mut means = [[[0.0f32; 3]; TILE]; TILE];
-
-                for k in 0..TILE_PACKETS {
-                    let view = &views[k];
-                    let lit = view.lit.to_array();
-
-                    let face_lights = packed([0, 1, 2, 3].map(|lane| {
-                        if lit[lane] == 0 {
-                            return [0.0; 3];
-                        }
-
-                        let key = keys[k][lane];
-
-                        if let Some((light, _)) = lights.lookup(key) {
-                            return light;
-                        }
-
-                        // another tile's new face, or kicked out mid frame (rare) //
-                        match privates[..private_count].iter().find(|p| p.0 == key) {
-                            Some(&(_, sum, n)) if n > 0.0 => sum.map(|c| c / n),
-                            _ => BOUNCE_AMBIENT.data,
-                        }
-                    }));
-
-                    let colors = lanes(Packed_Vec3_x4::select(
-                        view.lit,
-                        view.radiance + view.base * face_lights,
-                        view.radiance,
-                    ));
-
-                    let (corner_x, corner_y) = corners[k];
-                    let fresnel = view.fresnel.to_array();
-
-                    for (lane, color) in colors.iter().enumerate() {
-                        let x = corner_x + (lane & 1);
-                        let y = corner_y + (lane >> 1);
-                        let (tx, ty) = (x - tile_pixel00_x, y - tile_pixel00_y);
-
-                        // water gets its (maybe blurred) reflection on top //
-                        let color = if water_levels[ty][tx] == NO_WATER {
-                            *color
-                        } else {
-                            [0, 1, 2].map(|c| blurred[ty][tx][c].mul_add(fresnel[lane], color[c]))
-                        };
-
-                        // tiles never overlap, so every pixel is written by one thread
-                        let mean =
-                            unsafe { &mut *(accumulation as *mut [f32; 4]).add(y * width + x) };
-
-                        *mean = if moving {
-                            [color[0], color[1], color[2], 1.0]
-                        } else {
-                            let n = (mean[3] + 1.0).min(Self::ANTI_ALIAS_FRAMES);
-                            let mix = |old: f32, new: f32| old + (new - old) / n;
-                            [
-                                mix(mean[0], color[0]),
-                                mix(mean[1], color[1]),
-                                mix(mean[2], color[2]),
-                                mean[3] + 1.0,
-                            ]
-                        };
-
-                        means[y - tile_pixel00_y][x - tile_pixel00_x] = [mean[0], mean[1], mean[2]];
-                    }
-                }
-
-                /* DISPLAY */
-
-                let pointer = buffer_address as *mut u32;
-
-                for (y, row) in means.iter().enumerate() {
-                    let index = (tile_pixel00_y + y) * width + tile_pixel00_x;
-
-                    for (x, quad) in row.chunks_exact(4).enumerate() {
-                        let colors = display(packed([quad[0], quad[1], quad[2], quad[3]]));
-
-                        // tiles never overlap, so every pixel is written by one thread //
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                colors.to_array().as_ptr(),
-                                pointer.add(index + x * 4),
-                                4,
-                            );
-                        }
-                    }
-                }
+            .for_each(|(x0, y0)| {
+                let mut tile = Tile::new(x0, y0);
+
+                tile.primary(self, &setup);
+                tile.reflections(self);
+                tile.faces(self, &setup);
+                tile.shade(self, &setup);
+                tile.compose(self, &setup);
             });
 
         self.faces_lit = self.lights.take_lit();
@@ -693,21 +302,84 @@ impl Engine {
             });
     }
 
-    /// what one packet of camera rays hits first, an eye under water looks right through it
+    /// what one packet of camera rays hits first, an eye under water looks right through it.
+    /// nothing's in the way before start (meters), see beam_start
     #[inline(always)]
-    fn primary(&self, packet: Packet, underwater: bool, cone: f32) -> PacketHit {
+    fn primary(&self, packet: Packet, underwater: bool, start: f32) -> PacketHit {
         let tree = &self.world.tree;
+        let all = SimdU32::ALL_ACTIVE;
 
         if underwater {
-            tree.trace::<false, true>(
-                packet,
-                SimdU32::ALL_ACTIVE,
-                SimdF32::from_float(WATER_VISIBILITY),
-                cone,
-            )
+            let visible = SimdF32::from_float(WATER_VISIBILITY);
+            tree.trace_from::<false, true>(packet, all, visible, Self::CAMERA_CONE, start)
         } else {
-            tree.trace::<false, false>(packet, SimdU32::ALL_ACTIVE, SimdF32::INFY, cone)
+            tree.trace_from::<false, false>(packet, all, SimdF32::INFY, Self::CAMERA_CONE, start)
         }
+    }
+
+    /*
+        how far every camera ray of a block can go before it could possibly hit anything
+        (meters). origin + dir is the block's center ray, the block's other rays never get
+        further than spread * t from it
+
+        the center ray marches through the skip map, every meter knows the empty cube around it.
+        as long as the whole fan of rays fits inside the cube it's safe to jump, so each hop
+        goes until the fan's edge would touch a wall. the volume's sides count as walls too,
+        every ray has to start somewhere inside it (above the terrain's top is fine, a ray
+        up there just walks out through empty space)
+    */
+    fn beam_start(&self, origin: Vec3, dir: Vec3, spread: f32, underwater: bool) -> f32 {
+        let tree = &self.world.tree;
+        let walls = [Tree64::WIDTH; 3];
+        let mut t = 0.0f32;
+
+        for _ in 0..Self::BEAM_HOPS {
+            let p = origin + dir * t;
+            let reach = spread * t;
+
+            if (0..3).any(|a| p[a] < reach || p[a] > walls[a] - reach) {
+                break;
+            }
+
+            let meter = [0, 1, 2].map(|a| (p[a] as usize).min(Tree64::METERS_PER_AXIS - 1));
+            let empty = tree.skip[Tree64::skip_index(meter)][underwater as usize] as f32;
+
+            // the cube reaches empty - 1 meters around this meter //
+
+            if empty < 2.0 {
+                break;
+            }
+
+            let mut hop = f32::INFINITY;
+
+            for a in 0..3 {
+                let lo = (meter[a] as f32 - (empty - 1.0)).max(0.0);
+                let hi = (meter[a] as f32 + empty).min(walls[a]);
+                let speed = dir[a].abs();
+                let (ahead, behind) = if dir[a] >= 0.0 {
+                    (hi - p[a], p[a] - lo)
+                } else {
+                    (p[a] - lo, hi - p[a])
+                };
+
+                // the fan's edge closes in on the wall ahead at speed + spread, //
+                // and on the wall behind only if it spreads faster than the center leaves it
+                hop = hop.min((ahead - reach) / (speed + spread));
+
+                if spread > speed {
+                    hop = hop.min((behind - reach) / (spread - speed));
+                }
+            }
+
+            if hop < Self::BEAM_MIN_HOP {
+                break;
+            }
+
+            t += hop;
+        }
+
+        // a hair short, float rounding never gets to decide //
+        (t - 0.01).max(0.0)
     }
 
     /*
@@ -1006,6 +678,489 @@ impl Engine {
     }
 }
 
+/// what every tile needs to know about the frame
+struct Setup {
+    camera: Camera,
+    builder: PacketBuilder,
+    /// sub pixel offset of every camera ray this frame (pixels)
+    jitter: (f32, f32),
+    underwater: bool,
+    moving: bool,
+    frame: u32,
+    /// settled faces get shaded every nth frame, see LightCache::claim
+    every: u32,
+    /// render width (pixels)
+    width: usize,
+    /// the per pixel buffers and the output, tiles never overlap so every pixel
+    /// is only ever written by one thread
+    accumulation: usize,
+    depths: usize,
+    faces: usize,
+    pixels: usize,
+}
+
+/// one 16x16 tile, everything on the stack, one thread per tile at a time
+struct Tile {
+    /// top left pixel of the tile
+    x0: usize,
+    y0: usize,
+
+    /// what every packet of camera rays sees
+    views: [View; TILE_PACKETS],
+    /// face (or patch) key every lit lane sees, see LightCache::key
+    keys: [[u64; 4]; TILE_PACKETS],
+
+    /// lod level of the water every pixel sees, NO_WATER if it doesn't
+    water_levels: [[u8; TILE]; TILE],
+    /// reflections of the pixels that traced one
+    reflections: [[[f32; 3]; TILE]; TILE],
+    traced: [[bool; TILE]; TILE],
+
+    /// face samples waiting to be shaded
+    jobs: [Job; TILE_JOBS],
+    queued: usize,
+
+    /// faces nobody had light for yet that another tile is busy shading,
+    /// this tile shades them for itself: (key, light sum, samples)
+    privates: [(u64, [f32; 3], f32); TILE_PRIVATES],
+    private_count: usize,
+    /// new faces this tile claimed, its own pixels can just wait on those
+    claimed: [u64; TILE_PACKETS * 4],
+    claimed_count: usize,
+}
+
+impl Tile {
+    fn new(x0: usize, y0: usize) -> Self {
+        Self {
+            x0,
+            y0,
+            views: [View::EMPTY; TILE_PACKETS],
+            keys: [[0; 4]; TILE_PACKETS],
+            water_levels: [[NO_WATER; TILE]; TILE],
+            reflections: [[[0.0; 3]; TILE]; TILE],
+            traced: [[false; TILE]; TILE],
+            jobs: [Job::EMPTY; TILE_JOBS],
+            queued: 0,
+            privates: [(0, [0.0; 3], 0.0); TILE_PRIVATES],
+            private_count: 0,
+            claimed: [0; TILE_PACKETS * 4],
+            claimed_count: 0,
+        }
+    }
+
+    /* PRIMARY */
+
+    /// every packet's camera rays, what they hit and the water in front of it,
+    /// plus every pixel's view depth and face for the brush preview
+    fn primary(&mut self, engine: &Engine, setup: &Setup) {
+        let camera = &setup.camera;
+        let mut start = 0.0;
+
+        for k in 0..TILE_PACKETS {
+            // packets go in morton order, so every 16 of them are one 8x8 block //
+            if k % BLOCK_PACKETS == 0 {
+                start = self.block_start(engine, setup, k);
+            }
+
+            let (px, py) = packet_xy(k);
+            let (x, y) = (self.x0 + px, self.y0 + py);
+
+            let packet00 = camera.pixel_00 + camera.pixel_delta_x * (x as f32 + setup.jitter.0)
+                - camera.pixel_delta_y * (y as f32 + setup.jitter.1);
+
+            let packet = setup.builder.make(packet00);
+            let hit = engine.primary(packet, setup.underwater, start);
+            self.views[k] = engine.view(packet, hit, setup.underwater, Engine::CAMERA_CONE);
+
+            let ts = hit.distances.to_array();
+            let dirs = lanes(packet.directions);
+            let normals = lanes(hit.normals);
+            let hits = hit.hit.to_array();
+
+            for lane in 0..4 {
+                let i = (y + (lane >> 1)) * setup.width + x + (lane & 1);
+                let hit = hits[lane] != 0;
+
+                let depth = if hit {
+                    ts[lane] * Vec3 { data: dirs[lane] }.dot(camera.front)
+                } else {
+                    f32::INFINITY
+                };
+
+                // SAFETY: see Setup, this pixel belongs to this tile
+                unsafe {
+                    *(setup.depths as *mut f32).add(i) = depth;
+                    *(setup.faces as *mut u8).add(i) = face_id(normals[lane], hit);
+                }
+            }
+        }
+    }
+
+    /// where every camera ray of the 8x8 block starting at packet k can start walking,
+    /// see Engine::beam_start
+    fn block_start(&self, engine: &Engine, setup: &Setup, k: usize) -> f32 {
+        let camera = &setup.camera;
+
+        // the ray through a pixel (x, y), plus jitter, normalized //
+        let ray = |x: f32, y: f32| {
+            (camera.pixel_00 + camera.pixel_delta_x * (x + setup.jitter.0)
+                - camera.pixel_delta_y * (y + setup.jitter.1)
+                - camera.center)
+                .normalize()
+        };
+
+        let (bx, by) = packet_xy(k);
+        let (bx, by) = ((self.x0 + bx) as f32, (self.y0 + by) as f32);
+        let side = Engine::BEAM_PIXELS as f32;
+        let half = side * 0.5 - 0.5;
+        let center = ray(bx + half, by + half);
+
+        // a pixel past every corner, the block's rays never stray further than those //
+        let spread = [(-1.0, -1.0), (side, -1.0), (-1.0, side), (side, side)]
+            .map(|(cx, cy)| (ray(bx + cx, by + cy) - center).length())
+            .into_iter()
+            .fold(0.0, f32::max);
+
+        engine.beam_start(camera.center, center, spread, setup.underwater)
+    }
+
+    /* REFLECTIONS */
+
+    /// near water traces a reflection for every pixel, further out only every
+    /// REFLECTION_STEP-th pixel does and the rest blur together the ones around them
+    /// (see reflection). far pixels with none around them (shores) trace their own
+    fn reflections(&mut self, engine: &Engine) {
+        let mut queue = [(0usize, 0usize); TILE_PACKETS * 4];
+        let mut queued = 0;
+
+        for k in 0..TILE_PACKETS {
+            let view = &self.views[k];
+
+            if view.water.has_none_active() {
+                continue;
+            }
+
+            let water = view.water.to_array();
+            let origins = lanes(view.mirror_origins);
+
+            for lane in 0..4 {
+                if water[lane] == 0 {
+                    continue;
+                }
+
+                let (tx, ty) = lane_xy(k, lane);
+                let away = Vec3 {
+                    data: origins[lane],
+                } - engine.camera.center;
+                let level = ladder(away.length(), WATER_REFLECTION_DISTANCE) as usize;
+                let step = Engine::REFLECTION_STEP[level];
+                self.water_levels[ty][tx] = level as u8;
+
+                if tx % step == 0 && ty % step == 0 {
+                    queue[queued] = (k, lane);
+                    queued += 1;
+                }
+            }
+        }
+
+        self.trace_mirrors(engine, &queue[..queued]);
+        queued = 0;
+
+        for k in 0..TILE_PACKETS {
+            for lane in 0..4 {
+                let (tx, ty) = lane_xy(k, lane);
+
+                if self.water_levels[ty][tx] != NO_WATER && self.reflection(tx, ty).is_none() {
+                    queue[queued] = (k, lane);
+                    queued += 1;
+                }
+            }
+        }
+
+        self.trace_mirrors(engine, &queue[..queued]);
+    }
+
+    /// reflection rays for the queued (packet, lane)s, 4 at a time
+    fn trace_mirrors(&mut self, engine: &Engine, queue: &[(usize, usize)]) {
+        for group in queue.chunks(4) {
+            let pick = [0, 1, 2, 3].map(|j| group[j.min(group.len() - 1)]);
+            let origins = pick.map(|(k, lane)| lanes(self.views[k].mirror_origins)[lane]);
+            let dirs = pick.map(|(k, lane)| lanes(self.views[k].mirror_dirs)[lane]);
+            let colors = lanes(engine.reflect(packed(origins), packed(dirs)));
+
+            for (j, &(k, lane)) in group.iter().enumerate() {
+                let (tx, ty) = lane_xy(k, lane);
+                self.reflections[ty][tx] = colors[j];
+                self.traced[ty][tx] = true;
+            }
+        }
+    }
+
+    /// what a water pixel shows in its reflection: up close its own, further out the traced
+    /// ones on its grid within REFLECTION_BLUR, tent weighted so it fades out smoothly
+    /// (blurrier the further out). None = not water, or nothing traced around it yet
+    fn reflection(&self, tx: usize, ty: usize) -> Option<[f32; 3]> {
+        let level = self.water_levels[ty][tx];
+
+        if level == NO_WATER {
+            return None;
+        }
+
+        let level = level as usize;
+
+        if level == 0 {
+            return self.traced[ty][tx].then_some(self.reflections[ty][tx]);
+        }
+
+        let (step, reach) = (
+            Engine::REFLECTION_STEP[level],
+            Engine::REFLECTION_BLUR[level],
+        );
+        let grid = |c: usize| {
+            (c.saturating_sub(reach).div_ceil(step) * step..=(c + reach).min(TILE - 1))
+                .step_by(step)
+        };
+
+        let mut total = [0.0f32; 3];
+        let mut weight = 0.0;
+
+        for gy in grid(ty) {
+            for gx in grid(tx) {
+                if !self.traced[gy][gx] {
+                    continue;
+                }
+
+                let w = ((reach + 1 - gx.abs_diff(tx)) * (reach + 1 - gy.abs_diff(ty))) as f32;
+                total = [0, 1, 2].map(|c| self.reflections[gy][gx][c].mul_add(w, total[c]));
+                weight += w;
+            }
+        }
+
+        if weight > 0.0 {
+            Some(total.map(|c| c / weight))
+        } else {
+            // a shore pixel that had to trace its own //
+            self.traced[ty][tx].then_some(self.reflections[ty][tx])
+        }
+    }
+
+    /* FACES */
+
+    /// which face (or patch) each lit lane sees, and who has to shade what.
+    /// neighbors mostly see the same face, those don't even ask
+    fn faces(&mut self, engine: &Engine, setup: &Setup) {
+        let mut last = 0u64;
+
+        for k in 0..TILE_PACKETS {
+            let view = self.views[k];
+            let lit = view.lit.to_array();
+            let points = lanes(view.points);
+            let normals = lanes(view.normals);
+            let distances = view.distances.to_array();
+
+            for lane in 0..4 {
+                if lit[lane] == 0 {
+                    continue;
+                }
+
+                let (voxel, face) = face_of(points[lane], normals[lane]);
+                let key = LightCache::key(voxel, face, ladder(distances[lane], Engine::LOD_START));
+                self.keys[k][lane] = key;
+
+                if key == last {
+                    continue;
+                }
+                last = key;
+
+                let (target, samples) = match engine.lights.claim(key, setup.frame, setup.every) {
+                    Claim::Lit => continue,
+                    Claim::Shade { slot, samples } => {
+                        if samples == 0 && self.claimed_count < self.claimed.len() {
+                            self.claimed[self.claimed_count] = key;
+                            self.claimed_count += 1;
+                        }
+                        (slot, samples)
+                    }
+                    Claim::Missing => {
+                        // ours after all, already getting its own light, or no room left //
+                        if self.claimed[..self.claimed_count].contains(&key)
+                            || self.privates[..self.private_count]
+                                .iter()
+                                .any(|p| p.0 == key)
+                            || self.private_count == TILE_PRIVATES
+                        {
+                            continue;
+                        }
+
+                        self.privates[self.private_count].0 = key;
+                        self.private_count += 1;
+                        (PRIVATE | (self.private_count - 1) as u32, 0)
+                    }
+                };
+
+                let (tx, ty) = lane_xy(k, lane);
+                let pixel = (self.y0 + ty) * setup.width + self.x0 + tx;
+                let copies = if samples == 0 {
+                    Engine::FIRST_SAMPLES
+                } else {
+                    1
+                };
+
+                for copy in 0..copies {
+                    // a full queue gets shaded right away to make room //
+                    if self.queued == TILE_JOBS {
+                        self.shade(engine, setup);
+                    }
+
+                    self.jobs[self.queued] = Job {
+                        target,
+                        voxel,
+                        face,
+                        seed: pixel as u32 * Engine::FIRST_SAMPLES + copy,
+                    };
+                    self.queued += 1;
+                }
+            }
+        }
+    }
+
+    /* SHADE FACES */
+
+    /// every queued face sample, 4 at a time so no simd lane sits around idle
+    fn shade(&mut self, engine: &Engine, setup: &Setup) {
+        for group in self.jobs[..self.queued].chunks(4) {
+            // short groups just repeat their last job //
+            let pick = [0, 1, 2, 3].map(|j| group[j.min(group.len() - 1)]);
+
+            let mut rng = Rng::new(SimdU32::from(pick.map(|job| job.seed)), setup.frame);
+            let (u1, u2) = (rng.next().to_array(), rng.next().to_array());
+
+            // a random spot on the face, just off it //
+
+            let mut starts = [[0.0f32; 3]; 4];
+            let mut normals = [[0.0f32; 3]; 4];
+
+            for (j, job) in pick.iter().enumerate() {
+                let axis = job.face as usize / 2;
+                let sign = if job.face & 1 == 1 { 1.0 } else { -1.0 };
+                let mut spot = job.voxel.map(|c| c as f32);
+
+                spot[axis] += (sign > 0.0) as u32 as f32;
+                spot[(axis + 1) % 3] += u1[j];
+                spot[(axis + 2) % 3] += u2[j];
+
+                normals[j][axis] = sign;
+                starts[j] =
+                    [0, 1, 2].map(|a| spot[a].mul_add(VOXEL_SIZE, normals[j][a] * SURFACE_OFFSET));
+            }
+
+            let light = lanes(engine.face_light(packed(starts), packed(normals), &mut rng));
+
+            for (j, job) in group.iter().enumerate() {
+                if job.target & PRIVATE == 0 {
+                    engine.lights.add(job.target, light[j]);
+                } else {
+                    let private = &mut self.privates[(job.target & !PRIVATE) as usize];
+                    private.1 = [0, 1, 2].map(|c| private.1[c] + light[j][c]);
+                    private.2 += 1.0;
+                }
+            }
+        }
+
+        self.queued = 0;
+    }
+
+    /* COMPOSE + DISPLAY */
+
+    /// every pixel's surface times its face light, plus whatever got there without
+    /// touching a lit surface and any reflection. still frames keep a running mean,
+    /// then the whole tile gets tone mapped into the pixel buffer
+    fn compose(&self, engine: &Engine, setup: &Setup) {
+        for k in 0..TILE_PACKETS {
+            let view = &self.views[k];
+            let lit = view.lit.to_array();
+
+            let face_lights = packed([0, 1, 2, 3].map(|lane| {
+                if lit[lane] == 0 {
+                    return [0.0; 3];
+                }
+
+                let key = self.keys[k][lane];
+
+                if let Some((light, _)) = engine.lights.lookup(key) {
+                    return light;
+                }
+
+                // another tile's new face, or kicked out mid frame (rare) //
+                match self.privates[..self.private_count]
+                    .iter()
+                    .find(|p| p.0 == key)
+                {
+                    Some(&(_, sum, n)) if n > 0.0 => sum.map(|c| c / n),
+                    _ => BOUNCE_AMBIENT.data,
+                }
+            }));
+
+            let colors = lanes(Packed_Vec3_x4::select(
+                view.lit,
+                view.radiance + view.base * face_lights,
+                view.radiance,
+            ));
+            let fresnel = view.fresnel.to_array();
+
+            for (lane, color) in colors.iter().enumerate() {
+                let (tx, ty) = lane_xy(k, lane);
+
+                // water gets its reflection on top //
+                let color = match self.reflection(tx, ty) {
+                    Some(mirror) => [0, 1, 2].map(|c| mirror[c].mul_add(fresnel[lane], color[c])),
+                    None => *color,
+                };
+
+                // SAFETY: see Setup, this pixel belongs to this tile
+                let mean = unsafe {
+                    &mut *(setup.accumulation as *mut [f32; 4])
+                        .add((self.y0 + ty) * setup.width + self.x0 + tx)
+                };
+
+                *mean = if setup.moving {
+                    [color[0], color[1], color[2], 1.0]
+                } else {
+                    let n = (mean[3] + 1.0).min(Engine::ANTI_ALIAS_FRAMES);
+                    let mix = |old: f32, new: f32| old + (new - old) / n;
+                    [
+                        mix(mean[0], color[0]),
+                        mix(mean[1], color[1]),
+                        mix(mean[2], color[2]),
+                        mean[3] + 1.0,
+                    ]
+                };
+            }
+        }
+
+        // tone map the tile's means straight out of the accumulation buffer, 4 at a time //
+
+        for ty in 0..TILE {
+            let index = (self.y0 + ty) * setup.width + self.x0;
+
+            for x in (0..TILE).step_by(4) {
+                // SAFETY: see Setup, these pixels belong to this tile
+                unsafe {
+                    let first = (setup.accumulation as *const [f32; 4]).add(index + x);
+                    let means = *(first as *const [[f32; 4]; 4]);
+                    let colors = display(packed(means.map(|[r, g, b, _]| [r, g, b])));
+
+                    std::ptr::copy_nonoverlapping(
+                        colors.to_array().as_ptr(),
+                        (setup.pixels as *mut u32).add(index + x),
+                        4,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// face id of pixels that see sky
 const SKY_FACE: u8 = 255;
 
@@ -1039,14 +1194,12 @@ fn face_of(p: [f32; 3], n: [f32; 3]) -> ([u32; 3], u8) {
     (voxel, face_id(n, true))
 }
 
-/// rung of the lod ladder something this far away (meters) is on, 0 = full res up to LOD_START,
-/// then 1, 2, 3 = 2^level voxel blocks / light patches, each rung twice as far as the last
+/// rung of a ladder something this far away (meters) is on, 0 = full res up to start,
+/// then 1, 2, 3 each twice as far as the last. light patches climb it from LOD_START
+/// (2^level voxels wide), the reflection grid from WATER_REFLECTION_DISTANCE
 #[inline(always)]
-fn lod_level(distance: f32) -> u32 {
-    (distance * (2.0 / Engine::LOD_START))
-        .log2()
-        .floor()
-        .clamp(0.0, 3.0) as u32
+fn ladder(distance: f32, start: f32) -> u32 {
+    (distance >= start) as u32 + (distance >= start * 2.0) as u32 + (distance >= start * 4.0) as u32
 }
 
 /// a packet split into its 4 [x, y, z] lanes
@@ -1066,25 +1219,20 @@ fn packed(lanes: [[f32; 3]; 4]) -> Packed_Vec3_x4 {
     )
 }
 
-/// turn the tile 1D coordinate into the relative
-/// XY coordinates for the top left pixel in each packet
-/// yields every packet's top left pixel in the tile
-fn morton_to_xy(i: usize) -> (usize, usize) {
-    // this is not mine i found this shit on stack overflow bc i am not this smart
-    // https://stackoverflow.com/questions/4909263/how-to-efficiently-de-interleave-bits-inverse-morton
+/// top left pixel of the k-th packet in its tile (relative), packets go in morton order:
+/// bits 0, 2, 4 of k are x, bits 1, 3, 5 are y, in 2 pixel steps
+#[inline(always)]
+const fn packet_xy(k: usize) -> (usize, usize) {
+    let x = (k & 1) | ((k >> 1) & 2) | ((k >> 2) & 4);
+    let y = ((k >> 1) & 1) | ((k >> 2) & 2) | ((k >> 3) & 4);
+    (x * 2, y * 2)
+}
 
-    const EXTRACT_EVEN: fn(usize) -> usize = |i| {
-        (((i & 0x5555).wrapping_mul(0xC00030000C0003)) & 0x0600180060008001)
-            .wrapping_mul(0x0101010101010101)
-            >> 56
-    };
-    const EXTRACT_ODD: fn(usize) -> usize = |i| {
-        (((i & 0xAAAA).wrapping_mul(0xC00030000C0003)) & 0x03000C003000C000)
-            .wrapping_mul(0x0101010101010101)
-            >> 56
-    };
-
-    (EXTRACT_EVEN(i) * 2, EXTRACT_ODD(i) * 2)
+/// pixel (relative to its tile) of a packet's lane, lanes go left right, top bottom
+#[inline(always)]
+const fn lane_xy(k: usize, lane: usize) -> (usize, usize) {
+    let (x, y) = packet_xy(k);
+    (x + (lane & 1), y + (lane >> 1))
 }
 
 fn morton_decode(i: usize) -> (usize, usize) {
@@ -1105,6 +1253,102 @@ fn morton_decode(i: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::World;
+
+    #[test]
+    fn test_beam_start() {
+        let (width, height) = (256, 160);
+        let mut engine = Engine::new(width, height, World::new());
+
+        // xorshift, deterministic without pulling in a crate //
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+
+        let (mut packets, mut skipped) = (0, 0.0);
+
+        // cameras all over, high up and skimming the ground, looking every which way //
+
+        for view in 0..90 {
+            let height_above = [2.0, 40.0, 150.0][view % 3];
+            let (x, z) = (10.0 + rand() * 236.0, 10.0 + rand() * 236.0);
+            let ground = (0..250)
+                .rev()
+                .find(|&y| {
+                    engine
+                        .world
+                        .voxel([(x * 8.0) as i32, y * 8, (z * 8.0) as i32])
+                        .is_some()
+                })
+                .unwrap_or(0) as f32;
+
+            engine.camera.center = Vec3::new(x, (ground + height_above).min(250.0), z);
+            engine.camera.yaw = rand() * std::f32::consts::TAU;
+            engine.camera.pitch = (rand() - 0.7) * 1.2;
+            engine.camera.update();
+
+            let camera = engine.camera;
+            let setup = Setup {
+                camera,
+                builder: PacketBuilder::new(
+                    camera.center,
+                    camera.pixel_delta_x,
+                    camera.pixel_delta_y,
+                ),
+                jitter: (rand() - 0.5, rand() - 0.5),
+                underwater: engine.world.water_at(camera.center),
+                moving: true,
+                frame: 0,
+                every: 1,
+                width,
+                accumulation: 0,
+                depths: 0,
+                faces: 0,
+                pixels: 0,
+            };
+
+            // every ray from its block's start hits exactly what it hits from the eye //
+
+            for (x0, y0) in [(0, 0), (112, 64), (240, 144), (128, 0), (16, 96)] {
+                let tile = Tile::new(x0, y0);
+
+                for k in 0..TILE_PACKETS {
+                    let start = tile.block_start(&engine, &setup, k - k % BLOCK_PACKETS);
+                    let (px, py) = packet_xy(k);
+                    let packet00 = camera.pixel_00
+                        + camera.pixel_delta_x * ((x0 + px) as f32 + setup.jitter.0)
+                        - camera.pixel_delta_y * ((y0 + py) as f32 + setup.jitter.1);
+                    let packet = setup.builder.make(packet00);
+
+                    let full = engine.primary(packet, setup.underwater, 0.0);
+                    let jumped = engine.primary(packet, setup.underwater, start);
+
+                    assert_eq!(
+                        full.hit.to_array(),
+                        jumped.hit.to_array(),
+                        "view {view} start {start}"
+                    );
+                    assert_eq!(full.materials, jumped.materials);
+                    assert_eq!(full.distances.to_array(), jumped.distances.to_array());
+                    assert_eq!(lanes(full.normals), lanes(jumped.normals));
+
+                    packets += 1;
+                    skipped += start;
+                }
+            }
+        }
+
+        // and it actually skips something //
+        println!(
+            "{packets} packets, {:.1}m skipped on average",
+            skipped / packets as f32
+        );
+        assert!(skipped / packets as f32 > 1.0);
+    }
 
     #[test]
     fn test_faces_and_patches() {
@@ -1122,12 +1366,18 @@ mod tests {
 
         // the lod ladder: full res up close, then twice as coarse every time the distance doubles //
 
-        assert_eq!(lod_level(0.5), 0);
-        assert_eq!(lod_level(31.9), 0);
-        assert_eq!(lod_level(32.0), 1);
-        assert_eq!(lod_level(64.0), 2);
-        assert_eq!(lod_level(127.0), 2);
-        assert_eq!(lod_level(128.0), 3);
-        assert_eq!(lod_level(1000.0), 3);
+        let lod = |d: f32| ladder(d, Engine::LOD_START);
+        assert_eq!(lod(0.5), 0);
+        assert_eq!(lod(23.9), 0);
+        assert_eq!(lod(24.0), 1);
+        assert_eq!(lod(48.0), 2);
+        assert_eq!(lod(95.0), 2);
+        assert_eq!(lod(96.0), 3);
+        assert_eq!(lod(1000.0), 3);
+
+        // reflections keep their own ladder, full res out to where they stop //
+
+        assert_eq!(ladder(31.9, WATER_REFLECTION_DISTANCE), 0);
+        assert_eq!(ladder(32.0, WATER_REFLECTION_DISTANCE), 1);
     }
 }

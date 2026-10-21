@@ -88,9 +88,6 @@ impl Camera {
     }
 
     pub fn look_at(&mut self, target: Vec3) {
-        const UP_CLAMP: f32 = f32::to_radians(89.99);
-        const DOWN_CLAMP: f32 = f32::to_radians(-89.99);
-
         self.front = (target - self.center).normalize();
 
         self.right = Camera::WORLD_UP.cross(self.front).normalize();
