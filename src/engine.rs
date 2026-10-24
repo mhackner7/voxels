@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod input;
+pub mod lightcache;
 pub mod player;
 pub mod rendering;
 pub mod shading;
@@ -8,8 +9,10 @@ pub mod usage;
 
 use crate::math::vec3::Vec3;
 use crate::world::World;
+use crate::world::edit::Target;
 use camera::Camera;
 use input::handler::Handler;
+use lightcache::LightCache;
 use player::Player;
 use ui::Ui;
 use usage::Usage;
@@ -18,7 +21,6 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 use rayon::slice::ParallelSlice;
 
 pub struct Engine {
-    pub render_distance: f32, // in terms of voxels NOT chunks
     pub render_width: usize,
     pub render_height: usize,
 
@@ -41,12 +43,12 @@ pub struct Engine {
     pub bounce_lighting: bool,
     /// index into FRAME_BUDGETS: 60 fps, 30 fps, no target
     pub fps_target: usize,
-    /// index into MOVING_STEPS, how much moving frames cut corners to fit the budget
-    pub moving_step: usize,
-    /// how many tile slices the next still frame gets split into to fit the budget
-    pub still_slices: usize,
-    /// samples per pixel since the camera last moved (on average)
+    /// settled faces get re-lit every nth frame, the frame budget walks this up and down
+    pub every: u32,
+    /// frames since the camera last moved
     pub samples: f32,
+    /// face light samples shaded last frame
+    pub faces_lit: u32,
 
     /// milliseconds the last frame spent tracing / presenting
     pub render_ms: f32,
@@ -55,22 +57,14 @@ pub struct Engine {
     pub ui: Ui,
     pub usage: Usage,
 
-    /// running linear rgb sum of every sample since the camera last moved
+    /// running mean color of every pixel (linear rgb) + frames in it, anti aliasing only
     pub frame_accumulation_buffer: Vec<[f32; 4]>,
-    /// last frame's sums, a moving frame reprojects these instead of starting over
-    pub history: Vec<[f32; 4]>,
     /// view depth (meters along the camera front) of each pixel's first hit, infinity = sky
     pub frame_depths: Vec<f32>,
-    pub history_depths: Vec<f32>,
-    /// which voxel face each pixel sees (0..6, 255 = sky), history only sticks to the same face
+    /// which voxel face each pixel sees (0..6, 255 = sky)
     pub frame_faces: Vec<u8>,
-    pub history_faces: Vec<u8>,
-    /// running sum of each pixel's surface color + count, the accumulation only holds light
-    pub frame_albedo: Vec<[f32; 4]>,
-    /// the camera that drew history
-    pub last_camera: Camera,
-    /// false once the world looks different (sun, lighting), so old samples are no good
-    pub history_valid: bool,
+    /// the light on every voxel face that's been on screen, kept in the world
+    pub lights: LightCache,
     /// samples in the accumulation buffer, 0 = the next frame overwrites it
     pub frame_accumulation_count: u32,
     /// frames rendered since start, seeds the per pixel random numbers
@@ -80,6 +74,8 @@ pub struct Engine {
     pub input: Handler,
     pub player: Player,
     pub world: World,
+    /// the voxel under the crosshair (within reach), None = nothing to edit
+    pub target: Option<Target>,
 }
 
 impl Engine {
@@ -97,7 +93,8 @@ impl Engine {
     /// render_rows choices of the dev menu, multiples of the tile size
     pub const RENDER_ROWS: [usize; 4] = [352, 528, 720, 1088];
 
-    pub fn new(render_width: usize, render_height: usize) -> Self {
+    /// the world comes in already built (or loaded), see World::load_or_build
+    pub fn new(render_width: usize, render_height: usize, world: World) -> Self {
         println!("[Engine] Initializing render pipeline...");
         println!(
             "[Engine] Framebuffer: {}x{} ({} pixels, Morton tile size: {}x{})",
@@ -137,16 +134,7 @@ impl Engine {
         );
         camera.look_at(look_target);
 
-        let world_start = std::time::Instant::now();
-        println!("[Engine] Initializing Voxel World...");
-        let world = World::new();
-        println!(
-            "[Engine] World initialization finished in {:.2}ms",
-            world_start.elapsed().as_secs_f64() * 1000.0
-        );
-
         Self {
-            render_distance: 256.0,
             render_width,
             render_height,
             last_time: std::time::Instant::now(),
@@ -163,24 +151,20 @@ impl Engine {
             resize_render: false,
             bounce_lighting: true,
             fps_target: 1,
-            moving_step: 0,
-            still_slices: 1,
+            every: 1,
             samples: 0.0,
+            faces_lit: 0,
             render_ms: 0.0,
             present_ms: 0.0,
             ui: Ui::new(),
             usage: Usage::new(),
             frame_accumulation_buffer: vec![[0.0; 4]; render_width * render_height],
-            history: vec![[0.0; 4]; render_width * render_height],
             frame_depths: vec![f32::INFINITY; render_width * render_height],
-            history_depths: vec![f32::INFINITY; render_width * render_height],
             frame_faces: vec![255; render_width * render_height],
-            history_faces: vec![255; render_width * render_height],
-            frame_albedo: vec![[0.0; 4]; render_width * render_height],
-            last_camera: camera,
-            history_valid: false,
+            lights: LightCache::new(LightCache::SLOTS),
             frame_accumulation_count: 0,
             frame_index: 0,
+            target: None,
         }
     }
 
@@ -213,8 +197,6 @@ impl Engine {
         // keys, mouse and the player move //
 
         self.handle_input(delta_time);
-
-        let _ = self.render_distance;
 
         self.world.update(delta_time);
 

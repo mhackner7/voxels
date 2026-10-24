@@ -107,7 +107,7 @@ impl World {
 
     /// material at integer voxel coords, anything outside the volume is air
     #[inline(always)]
-    fn voxel(&self, [x, y, z]: [i32; 3]) -> Option<Material> {
+    pub fn voxel(&self, [x, y, z]: [i32; 3]) -> Option<Material> {
         // a negative coord or any bit above 2047 lands outside //
         if (x | y | z) & !(Tree64::VOXELS_PER_AXIS - 1) != 0 {
             return None;

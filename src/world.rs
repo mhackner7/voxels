@@ -2,7 +2,9 @@ use crate::world::sun::Sun;
 use crate::world::tree64::Tree64;
 
 pub mod build;
+pub mod cache;
 pub mod collision;
+pub mod edit;
 pub mod leaf;
 pub mod sun;
 pub mod terrain;
@@ -16,8 +18,9 @@ pub struct World {
 }
 
 impl World {
+    /// a freshly generated world, no cache involved (the tests use this)
+    #[cfg(test)]
     pub fn new() -> Self {
-        println!("[World] Initializing voxel world with procedural seed 42...");
         World {
             tree: Tree64::build(42),
             sun: Sun::default(),

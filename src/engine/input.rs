@@ -7,6 +7,7 @@ pub mod util;
 
 use crate::engine::input::commands::*;
 use crate::engine::player::GaitState;
+use crate::world::voxel::{Material, VOXELS_PER_METER};
 
 use super::*;
 
@@ -48,6 +49,90 @@ impl Engine {
 
         if self.player.position.data != before.data {
             self.frame_accumulation_count = 0;
+        }
+
+        self.camera.update();
+        self.target = self
+            .world
+            .raycast(self.camera.center, self.camera.front, Player::REACH);
+
+        if !self.ui.menu {
+            self.edit_input(dt);
+        }
+    }
+
+    /// left click breaks, right click places what's in hand, both repeat while held.
+    /// scroll sizes the brush, arrows cycle the hand, middle click picks up the target
+    fn edit_input(&mut self, dt: f32) {
+        let activity = &self.input.activity;
+        let player = &mut self.player;
+
+        if activity.was_pressed(PlayerCommands::BrushGrow.into()) {
+            player.brush = (player.brush + 1).min(World::BRUSH_MAX);
+        }
+
+        if activity.was_pressed(PlayerCommands::BrushShrink.into()) {
+            player.brush = (player.brush - 1).max(1);
+        }
+
+        let cycle = activity.was_pressed(InventoryCommands::Next.into()) as i32
+            - activity.was_pressed(InventoryCommands::Back.into()) as i32;
+
+        if cycle != 0 {
+            let at = Player::HAND
+                .iter()
+                .position(|&m| m == player.hand)
+                .unwrap_or(0) as i32;
+            player.hand = Player::HAND[(at + cycle).rem_euclid(Player::HAND.len() as i32) as usize];
+        }
+
+        let Some(target) = self.target else {
+            return;
+        };
+
+        if activity.was_pressed(PlayerCommands::Select.into()) {
+            player.hand = target.material;
+        }
+
+        // a fresh click goes off right away, holding it repeats every EDIT_REPEAT //
+
+        let carve = activity.is_held(PlayerCommands::Destroy.into());
+        let place = activity.is_held(PlayerCommands::Interact.into());
+
+        if activity.was_pressed(PlayerCommands::Destroy.into())
+            || activity.was_pressed(PlayerCommands::Interact.into())
+        {
+            player.edit_cooldown = 0.0;
+        }
+
+        player.edit_cooldown -= dt;
+
+        if !(carve || place) || player.edit_cooldown > 0.0 {
+            return;
+        }
+
+        player.edit_cooldown = Player::EDIT_REPEAT;
+
+        let material = if carve { Material::Air } else { player.hand };
+        let center = World::brush_center(&target, player.brush, !carve);
+
+        // never build the player into a wall, unless it can fly through walls anyway //
+        let keep_out =
+            (!(player.noclip && player.flying())).then(|| Player::hitbox(player.position));
+
+        if self.world.edit(center, player.brush, material, keep_out) {
+            // faces around it (and a meter more for shadows / bounce) go back to being young, //
+            // they re-light over the next few frames, everything else keeps its light
+
+            let reach = player.brush as f32 * 0.5 + VOXELS_PER_METER;
+            let lo = [0, 1, 2].map(|a| (center[a] - reach).floor() as i32);
+            let hi = [0, 1, 2].map(|a| (center[a] + reach).ceil() as i32);
+
+            self.lights.invalidate(lo, hi);
+            self.frame_accumulation_count = 0;
+            self.target = self
+                .world
+                .raycast(self.camera.center, self.camera.front, Player::REACH);
         }
     }
 

@@ -58,16 +58,6 @@ pub struct PacketHit {
     pub materials: [Material; 4],
 }
 
-impl PacketHit {
-    /// nothing hit on any lane
-    pub const MISS: Self = Self {
-        hit: SimdU32::ALL_INACTIVE,
-        distances: SimdF32::INFY,
-        normals: Packed_Vec3_x4::ZEROES,
-        materials: [Material::Air; 4],
-    };
-}
-
 impl Tree64 {
     /// depth of the leaf level (0.25m blocks), the 4 branch levels (64m, 16m, 4m, 1m cells) sit above it
     /// node_stack[LEAF_DEPTH] holds the index of the current leaf
@@ -125,7 +115,22 @@ impl Tree64 {
         max_ts: SimdF32,
         cone: f32,
     ) -> PacketHit {
-        let mut walk = PacketWalk::begin(self, packet, active, max_ts, cone);
+        self.trace_from::<ANY_HIT, SKIP_WATER>(packet, active, max_ts, cone, 0.0)
+    }
+
+    /// trace, but every lane starts walking at start (meters along the ray) instead of
+    /// where it enters the volume. the caller promises there's nothing to hit before that,
+    /// and that every lane is still inside the volume there (see Engine::beam_start)
+    #[inline(always)]
+    pub fn trace_from<const ANY_HIT: bool, const SKIP_WATER: bool>(
+        &self,
+        packet: Packet,
+        active: SimdU32,
+        max_ts: SimdF32,
+        cone: f32,
+        start: f32,
+    ) -> PacketHit {
+        let mut walk = PacketWalk::begin(self, packet, active, max_ts, cone, start);
 
         // occupancy skips dead lanes, so a packet that starts out empty just falls right through //
 
@@ -231,7 +236,14 @@ struct PacketWalk {
 
 impl PacketWalk {
     #[inline(always)]
-    fn begin(tree: &Tree64, packet: Packet, active: SimdU32, max_ts: SimdF32, cone: f32) -> Self {
+    fn begin(
+        tree: &Tree64,
+        packet: Packet,
+        active: SimdU32,
+        max_ts: SimdF32,
+        cone: f32,
+        start: f32,
+    ) -> Self {
         // split up the packet //
 
         let origins = packet.origins;
@@ -262,7 +274,11 @@ impl PacketWalk {
             to compare boundary distances, so no epsilon nudging is needed
         */
 
-        let ts = SimdF32::select(active, entry_ts, SimdF32::ZEROES);
+        let ts = SimdF32::select(
+            active,
+            entry_ts.max(SimdF32::from_float(start)),
+            SimdF32::ZEROES,
+        );
 
         let vpm = SimdF32::from_float(VOXELS_PER_METER);
         let max_voxel = SimdI32::from(Tree64::VOXELS_PER_AXIS - 1);
@@ -379,6 +395,26 @@ impl PacketWalk {
                     let blocks =
                         unsafe { tree.leaf_blocks.get_unchecked(node) }[SKIP_WATER as usize];
 
+                    // the ray is as wide as a whole 4x4x4 group of blocks by now, //
+                    // so any block in it makes the group solid (or the empty group gets hopped)
+
+                    if lod >= 2 {
+                        let base = block & 0b101010;
+                        let in_group = blocks & (GROUP << base);
+
+                        if in_group == 0 {
+                            group = true;
+                            break false;
+                        }
+
+                        if !ANY_HIT {
+                            let summary = unsafe { tree.leaf_block_materials.get_unchecked(node) };
+                            self.materials[i] = top_material(in_group, summary, SKIP_WATER);
+                        }
+
+                        break true;
+                    }
+
                     if (blocks >> block) & 1 == 0 {
                         group = (blocks >> (block & 0b101010)) & GROUP == 0;
                         break false;
@@ -473,9 +509,27 @@ impl PacketWalk {
                 // occupancy masks are compressed, so:
                 // child_pointer + number of set bits before current cell
 
+                let child = branch.child_pointer + (branch.children & (bit - 1)).count_ones();
+
+                // the ray is a whole meter wide by now, a leaf with anything in it is one solid cell //
+                // (a water only leaf is nothing to a ray looking through water, it gets stepped)
+
+                if !ANY_HIT && depth == Tree64::LEAF_DEPTH - 1 && lod >= 3 {
+                    let blocks = unsafe { tree.leaf_blocks.get_unchecked(child as usize) }
+                        [SKIP_WATER as usize];
+
+                    if blocks == 0 {
+                        break false;
+                    }
+
+                    let summary =
+                        unsafe { tree.leaf_block_materials.get_unchecked(child as usize) };
+                    self.materials[i] = top_material(blocks, summary, SKIP_WATER);
+                    break true;
+                }
+
                 unsafe {
-                    *self.node_stack[i].get_unchecked_mut(depth + 1) =
-                        branch.child_pointer + (branch.children & (bit - 1)).count_ones();
+                    *self.node_stack[i].get_unchecked_mut(depth + 1) = child;
                 }
 
                 depth += 1;
@@ -698,6 +752,26 @@ fn lod_shift(footprint: f32) -> i32 {
     ((footprint.to_bits() >> 23) & 0xFF) as i32 - 127
 }
 
+/// how a lumped bunch of blocks looks from afar: the summary material of its highest block.
+/// blocks = some of one leaf's block bits (never 0), summary = that leaf's leaf_block_materials
+#[inline(always)]
+fn top_material(blocks: u64, summary: &[u8; 64], skip_water: bool) -> Material {
+    // the 16 blocks of one y layer, block index = x | (y << 2) | (z << 4) //
+    const LAYER: u64 = 0x000F_000F_000F_000F;
+
+    let mut y = 3;
+    while y > 0 && blocks & (LAYER << (4 * y)) == 0 {
+        y -= 1;
+    }
+
+    let block = (blocks & (LAYER << (4 * y))).trailing_zeros() as usize;
+    let nibble = (summary[block] >> (4 * skip_water as u8)) & 15;
+
+    // SAFETY: the build only ever writes Material values in here
+    unsafe { std::mem::transmute::<u8, Material>(nibble) }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Branch {
     /// 4x4x4 cells that have a child node (a branch, or a leaf at depth 3)
@@ -713,6 +787,10 @@ pub struct Branch {
     /// index of the first child in the branch or leaf pool
     /// children are contiguous, offset = popcount(children & cells before)
     pub child_pointer: u32,
+
+    /// unused, it's just the 4 bytes that round the node up to 32, spelled out
+    /// so there's no hidden padding when the world cache writes branches out raw
+    pub spare: u32,
 }
 
 impl Branch {
@@ -721,12 +799,14 @@ impl Branch {
         solid: 0,
         water: 0,
         child_pointer: 0,
+        spare: 0,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::World;
     use crate::world::terrain::Terrain;
 
     fn primary(tree: &Tree64, packet: Packet) -> PacketHit {
@@ -936,8 +1016,10 @@ mod tests {
     }
 
     /// run every flavor of trace against the reference, returns mismatches
-    fn compare<const ANY_HIT: bool, const SKIP_WATER: bool>(tree: &Tree64) -> usize {
-        let rays = test_rays();
+    fn compare<const ANY_HIT: bool, const SKIP_WATER: bool>(
+        tree: &Tree64,
+        rays: &[(Vec3, Vec3)],
+    ) -> usize {
         let mut mismatches = 0;
 
         for chunk in rays.chunks(4) {
@@ -1012,11 +1094,12 @@ mod tests {
     #[test]
     fn test_trace_matches_reference() {
         let tree = Tree64::build(1337);
+        let rays = test_rays();
 
-        let mismatches = compare::<false, false>(&tree)
-            + compare::<false, true>(&tree)
-            + compare::<true, true>(&tree)
-            + compare::<true, false>(&tree);
+        let mismatches = compare::<false, false>(&tree, &rays)
+            + compare::<false, true>(&tree, &rays)
+            + compare::<true, true>(&tree, &rays)
+            + compare::<true, false>(&tree, &rays);
 
         assert_eq!(mismatches, 0);
     }
@@ -1044,6 +1127,11 @@ mod tests {
 
                 if exact.hit.to_array()[lane] != 0 {
                     assert!(wide.hit.to_array()[lane] != 0);
+                    assert_ne!(
+                        wide.materials[lane],
+                        Material::Air,
+                        "lod hits keep a material"
+                    );
                     assert!(
                         w[lane] <= e[lane] + 1e-3,
                         "lod hit {} past exact {}",
@@ -1093,6 +1181,152 @@ mod tests {
         }
 
         assert!(checked > 100);
+    }
+
+    #[test]
+    fn test_edits() {
+        use crate::world::World;
+        use crate::world::sun::Sun;
+
+        let mut world = World {
+            tree: Tree64::build(1337),
+            sun: Sun::default(),
+        };
+
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+
+        let materials = [
+            Material::Dirt,
+            Material::Grass,
+            Material::Stone,
+            Material::Wood,
+            Material::Leaves,
+            Material::Snow,
+            Material::Water,
+        ];
+
+        // surface spots under random rays, plus deep inside solid stone and up in the open sky //
+
+        let mut brushes = Vec::new();
+
+        for _ in 0..600 {
+            let o = Vec3::new(rand() * 256.0, 200.0, rand() * 256.0);
+            let d = Vec3::new(rand() - 0.5, -2.0, rand() - 0.5).normalize();
+
+            if let Some(target) = world.raycast(o, d, 250.0) {
+                let diameter = 1 + (rand() * 8.0) as u32 % 8;
+                let place = rand() < 0.5;
+                let material = if place {
+                    materials[(rand() * 7.0) as usize % 7]
+                } else {
+                    Material::Air
+                };
+
+                brushes.push((
+                    World::brush_center(&target, diameter, place),
+                    diameter,
+                    material,
+                ));
+            }
+        }
+
+        brushes.push((Vec3::new(1024.0, 16.0, 1024.0), 8, Material::Air));
+        brushes.push((Vec3::new(800.0, 1840.0, 800.0), 4, Material::Wood));
+
+        // every voxel around each brush ends up exactly how the brush says //
+
+        let mut rays = test_rays();
+
+        for &(center, diameter, material) in &brushes {
+            let carve = material == Material::Air;
+            let lo = [0, 1, 2].map(|a| center[a].floor() as i32 - 5);
+
+            let mut before = Vec::new();
+            for z in lo[2]..lo[2] + 11 {
+                for y in lo[1]..lo[1] + 11 {
+                    for x in lo[0]..lo[0] + 11 {
+                        before.push(([x, y, z], world.voxel([x, y, z])));
+                    }
+                }
+            }
+
+            world.edit(center, diameter, material, None);
+
+            for (voxel, old) in before {
+                let now = world.voxel(voxel);
+                let old_material = old.unwrap_or(Material::Air);
+                let open = old_material == Material::Air || old_material == Material::Water;
+                let inside = World::in_brush(voxel, center, diameter)
+                    && voxel
+                        .iter()
+                        .all(|&c| (0..Tree64::VOXELS_PER_AXIS).contains(&c));
+
+                let ok = match (inside, carve, open) {
+                    (true, true, false) => now.is_none() || now == Some(Material::Water),
+                    (true, false, true) => now == Some(material),
+                    _ => now == old,
+                };
+
+                assert!(
+                    ok,
+                    "{voxel:?} was {old:?} now {now:?}, brush {center:?} {diameter} {material:?}"
+                );
+            }
+
+            // rays straight at the edit, from above, sideways and from its center. //
+            // directions stay off the lattice, the center is a voxel center / corner
+            // and an exact tie there can go either (valid) way
+
+            let m = center * VOXEL_SIZE;
+            let dirs = [
+                Vec3::new(0.0113, -1.0, 0.0217),
+                Vec3::new(1.0, -0.0531, 0.0347),
+                Vec3::new(0.3119, 0.2063, 1.0),
+            ];
+
+            rays.push((m + Vec3::new(0.03, 20.0, 0.07), dirs[0].normalize()));
+            rays.push((m + Vec3::new(-3.0, 0.02, 0.01), dirs[1].normalize()));
+            rays.push((m, dirs[2].normalize()));
+        }
+
+        // the sky ball sticks out above the old terrain top, rays still find it //
+
+        let packet = Packet::from_vecs(
+            [Vec3::new(100.06, 250.0, 100.06); 4],
+            [Vec3::new(0.0, -1.0, 0.0); 4],
+        );
+        let hit = primary(&world.tree, packet);
+        assert_eq!(hit.materials[0], Material::Wood);
+        assert!((hit.distances.to_array()[0] - 19.75).abs() < 1e-3);
+
+        // the traversal (leaf summaries, skip map, top bound) agrees with the plain walk //
+
+        let mismatches = compare::<false, false>(&world.tree, &rays)
+            + compare::<false, true>(&world.tree, &rays)
+            + compare::<true, true>(&world.tree, &rays)
+            + compare::<true, false>(&world.tree, &rays);
+
+        assert_eq!(mismatches, 0);
+
+        // the skip map is never bigger than a fresh one, too small is fine //
+
+        let fresh = world.tree.build_skip();
+        let over = (0..fresh.len())
+            .filter(|&i| (0..2).any(|k| world.tree.skip[i][k] > fresh[i][k]))
+            .count();
+
+        println!(
+            "{} edits, {} leaves",
+            brushes.len(),
+            world.tree.leaves.len()
+        );
+        assert_eq!(over, 0);
     }
 
     #[test]
@@ -1189,7 +1423,7 @@ mod tests {
     #[test]
     fn test_render_one_frame() {
         let (width, height) = (640, 352);
-        let mut engine = crate::engine::Engine::new(width, height);
+        let mut engine = crate::engine::Engine::new(width, height, World::new());
         let mut buffer = vec![0u32; width * height];
 
         engine.frame(buffer.as_mut_ptr() as usize);
@@ -1263,7 +1497,7 @@ mod tests {
         // accumulated views //
 
         let (width, height) = (960, 544);
-        let mut engine = crate::engine::Engine::new(width, height);
+        let mut engine = crate::engine::Engine::new(width, height, World::new());
 
         // whole frames, every one of the 64 renders is a full sample //
         engine.fps_target = 2;

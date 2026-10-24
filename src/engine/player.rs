@@ -11,8 +11,12 @@ pub struct Player {
     /// meters per second, only y is simulated (gravity / jumps),
     /// x and z come straight from the keys every frame
     pub velocity: Vec3,
-    /// whatever's in hand, nothing uses it yet
+    /// what gets placed (right click), middle click picks up whatever you're looking at
     pub hand: Material,
+    /// brush diameter in voxels (1..=World::BRUSH_MAX), scroll grows / shrinks it
+    pub brush: u32,
+    /// seconds until a held mouse button edits again
+    pub edit_cooldown: f32,
 
     /// flying straight through walls
     pub noclip: bool,
@@ -78,6 +82,23 @@ impl Player {
     pub const FLY_RAMP: f32 = 0.8;
     pub const FLY_BOOST_MAX: f32 = 16.0;
 
+    /// what the arrows cycle through
+    pub const HAND: [Material; 7] = [
+        Material::Stone,
+        Material::Dirt,
+        Material::Grass,
+        Material::Wood,
+        Material::Leaves,
+        Material::Snow,
+        Material::Water,
+    ];
+
+    /// how far away you can break / place stuff (meters)
+    pub const REACH: f32 = 16.0;
+
+    /// seconds between edits while a mouse button is held
+    pub const EDIT_REPEAT: f32 = 0.15;
+
     /// walking physics (m/s^2, m/s), a jump clears about 1.2m
     pub const GRAVITY: f32 = 25.0;
     pub const JUMP_SPEED: f32 = 7.75;
@@ -100,7 +121,9 @@ impl Player {
             },
             position,
             velocity: Vec3::DEFAULT,
-            hand: Material::Air,
+            hand: Material::Stone,
+            brush: 1,
+            edit_cooldown: 0.0,
             noclip: false,
             move_speed: 1.0,
             fly_boost: 1.0,
@@ -244,7 +267,7 @@ impl Player {
 
     /// world space hitbox at an eye position
     #[inline(always)]
-    fn hitbox(eye: Vec3) -> (Vec3, Vec3) {
+    pub fn hitbox(eye: Vec3) -> (Vec3, Vec3) {
         (eye + Self::BOX_MIN, eye + Self::BOX_MAX)
     }
 

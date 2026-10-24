@@ -3,12 +3,13 @@ use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::error::EventLoopError;
-use winit::event::WindowEvent;
+use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::engine::Engine;
+use crate::world::World;
 
 pub struct App<'a> {
     window: Option<Arc<Window>>,
@@ -26,7 +27,7 @@ pub struct App<'a> {
 
 impl App<'_> {
     /// render_rows is the fixed render height, the width follows the window aspect
-    pub fn new(width: usize, height: usize, render_rows: usize) -> Self {
+    pub fn new(width: usize, height: usize, render_rows: usize, world: World) -> Self {
         let (render_width, render_height) = render_size(width, height, render_rows);
 
         Self {
@@ -34,7 +35,7 @@ impl App<'_> {
             pixel_buffer: None,
             width,
             height,
-            engine: Engine::new(render_width, render_height),
+            engine: Engine::new(render_width, render_height, world),
         }
     }
 
@@ -176,18 +177,27 @@ impl ApplicationHandler for App<'_> {
                 _ => (),
             },
             WindowEvent::MouseInput {
-                device_id,
+                device_id: _,
                 state,
                 button,
             } => self.engine.input.push(button.into(), state.into()),
             WindowEvent::MouseWheel {
-                device_id,
+                device_id: _,
                 delta,
-                phase,
+                phase: _,
             } => {
-                self.engine
-                    .input
-                    .push(delta.into(), crate::engine::input::util::State::Pressed);
+                // trackpads send zero deltas when a scroll ends, those would count as up //
+
+                let still = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y == 0.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y == 0.0,
+                };
+
+                if !still {
+                    self.engine
+                        .input
+                        .push(delta.into(), crate::engine::input::util::State::Pressed);
+                }
             }
             _ => (),
         }
