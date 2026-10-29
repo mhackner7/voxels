@@ -31,7 +31,7 @@ the world is 256m x 256m x 256m made of 0.125m voxels, so 2048³ voxels (about 8
 - a skip map (one byte per meter) stores how far away the nearest solid meter is, so rays can jump whole empty cubes instead of stepping cell by cell. theres a second one that ignores water for rays looking through it
 
 ### tracing
-- rays go out in packets of 4 using 4 wide simd (arm neon for now, the x86 side is still just stubs so it only runs on apple silicon / arm)
+- rays go out in packets of 4 using 4 wide simd (arm neon only for now, x86 refuses to compile until it gets its own backend, so it only runs on apple silicon / arm)
 - the screen is cut into 16x16 tiles walked in morton order and spread across every core with rayon, tiles never overlap so no locks
 - traversal keeps an ancestor stack, the highest bit that changed on a step says how far back up the tree to go
 - camera rays get a head start: every 8x8 pixel block marches its center ray through the skip map, and as long as the whole fan of its rays fits inside the empty cubes it can jump ahead. all 16 packets of the block start from there, saves about a fifth of the frame near the ground
@@ -95,6 +95,11 @@ cargo run --release -- --new-world   # always generate a fresh one
 tests (traversal gets checked against a dumb exact reference walk on 13k+ rays, plus lakes, collision and walking):
 ```
 cargo test --release
+```
+
+perf check (moving frame times at 720p over 4 fixed views, compare the min column, the median drifts as the laptop heats up):
+```
+cargo test --release bench_views -- --ignored --nocapture
 ```
 
 

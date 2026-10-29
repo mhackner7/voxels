@@ -1,4 +1,5 @@
 use super::lightcache::{Claim, LightCache};
+use super::lighting::View;
 use super::shading::*;
 use super::*;
 use crate::simd::packetray::{Packet, PacketBuilder};
@@ -7,57 +8,15 @@ use crate::simd::simdf32::SimdF32;
 use crate::simd::simdu32::SimdU32;
 use crate::world::sun::SUN_SIZE;
 use crate::world::tree64::{PacketHit, Tree64};
-use crate::world::voxel::{Material, VOXEL_SIZE, VOXELS_PER_METER};
-
-/// what one packet of camera rays ends up looking at, water already dealt with,
-/// the light on the surface gets read from the face light cache later
-#[derive(Clone, Copy)]
-struct View {
-    /// light that made it to the camera without landing on a lit surface (sky, water, fog),
-    /// water reflections get added on top later, see REFLECTIONS
-    radiance: Packed_Vec3_x4,
-    /// how much the surface reflects, already dimmed by any water in front of it
-    base: Packed_Vec3_x4,
-    /// spot on the surface (meters) and its face normal
-    points: Packed_Vec3_x4,
-    normals: Packed_Vec3_x4,
-    /// how far the light traveled from the surface to the eye (meters), sizes the light patch
-    distances: SimdF32,
-    /// lanes that actually see a surface worth lighting
-    lit: SimdU32,
-
-    /// lanes looking at a water surface, how much of its reflection shows (fresnel),
-    /// and the reflection ray: from just above the surface, mirrored
-    water: SimdU32,
-    fresnel: SimdF32,
-    mirror_origins: Packed_Vec3_x4,
-    mirror_dirs: Packed_Vec3_x4,
-}
-
-impl View {
-    const EMPTY: Self = Self {
-        radiance: Packed_Vec3_x4::ZEROES,
-        base: Packed_Vec3_x4::ZEROES,
-        points: Packed_Vec3_x4::ZEROES,
-        normals: Packed_Vec3_x4::ZEROES,
-        distances: SimdF32::ZEROES,
-        lit: SimdU32::ALL_INACTIVE,
-        water: SimdU32::ALL_INACTIVE,
-        fresnel: SimdF32::ZEROES,
-        mirror_origins: Packed_Vec3_x4::ZEROES,
-        mirror_dirs: Packed_Vec3_x4::ZEROES,
-    };
-}
+use crate::world::voxel::{VOXEL_SIZE, VOXELS_PER_METER};
 
 /// one light sample to take for a face
 #[derive(Clone, Copy)]
 struct Job {
     /// cache slot it goes into, or (PRIVATE | n) for the tile's own n-th private face
     target: u32,
-    /// the voxel and which of its faces
     voxel: [u32; 3],
     face: u8,
-    /// random seed, different for every sample of the same face
     seed: u32,
 }
 
@@ -70,7 +29,6 @@ impl Job {
     };
 }
 
-/// water level of pixels that don't see water
 const NO_WATER: u8 = u8::MAX;
 
 /// marks a job whose light only this tile keeps (see Claim::Missing)
@@ -79,23 +37,19 @@ const PRIVATE: u32 = 1 << 31;
 /// pixels along one side of a tile
 const TILE: usize = Engine::PIXELS_PER_TILE_AXIS;
 
-/// packets in a tile (2x2 pixels each)
 const TILE_PACKETS: usize = (TILE / 2) * (TILE / 2);
 
-/// packets in one beam block
 const BLOCK_PACKETS: usize = (Engine::BEAM_PIXELS / 2) * (Engine::BEAM_PIXELS / 2);
 
-/// face samples a tile queues up before shading them
 const TILE_JOBS: usize = TILE_PACKETS * 4;
 
 /// most private faces a tile keeps, past that they just get ambient light for a frame
 const TILE_PRIVATES: usize = 64;
 
 impl Engine {
-    /// once a still image has this many frames we just stop tracing
     pub const MAX_ACCUMULATED_FRAMES: u32 = 128;
 
-    /// a still pixel's color is the mean of its last this many frames, that's the anti aliasing
+    /// running mean window of a still pixel, that's the anti aliasing
     pub const ANTI_ALIAS_FRAMES: f32 = 16.0;
 
     /// bounce rays that get further than this (meters) just count as open sky
@@ -110,43 +64,32 @@ impl Engine {
     /// share of the budget a frame aims for, the rest goes to ui and present
     pub const BUDGET_SHARE: f32 = 0.85;
 
-    /// slowest the budget lets settled faces refresh (every nth frame)
     pub const MAX_EVERY: u32 = 64;
 
-    /// face samples a frame always gets to shade, even over budget. shading is cheap,
-    /// a slow frame is mostly camera rays, so starving the faces wouldn't buy much
+    /// face samples a frame always shades, even over budget (slow frames are camera rays anyway)
     pub const LIT_FLOOR: u32 = 16384;
 
-    /*
-        the lod ladder, same for the geometry and the face light: full res up to LOD_START,
-        then 2x2x2 voxel blocks, 4x4x4 from twice that, 8x8x8 (a whole meter) from 4x as far.
-        camera rays get one voxel wider every LOD_START / 2 meters, so the traversal's
-        floor(log2(width)) lands on exactly those steps
-    */
+    // lod ladder: full res up to LOD_START, then 2x2x2 / 4x4x4 / 8x8x8 each time the distance doubles
     pub const LOD_START: f32 = 24.0;
     pub const CAMERA_CONE: f32 = 2.0 / Self::LOD_START;
 
-    /// far water only traces every nth pixel's reflection (per lod level), every water pixel
-    /// out there then blurs together the ones within REFLECTION_BLUR pixels of it
+    /// far water traces every nth pixel's reflection and blurs the rest together
     pub const REFLECTION_STEP: [usize; 4] = [1, 2, 4, 4];
     pub const REFLECTION_BLUR: [usize; 4] = [0, 2, 4, 6];
 
-    /// skip map hops a beam gets at most, and the shortest one still worth a lookup (meters)
+    /// max skip map hops per beam, and the shortest hop worth a lookup (meters)
     pub const BEAM_HOPS: usize = 16;
     pub const BEAM_MIN_HOP: f32 = 0.25;
 
-    /// pixels along one side of a beam block, every packet in it starts at the block's beam_start
     pub const BEAM_PIXELS: usize = 8;
 
     /// samples a brand new face gets right away, one sample per face looks like confetti
     pub const FIRST_SAMPLES: u32 = 4;
 
-    /// lod cones (voxels of width per meter traveled) for rays that start on a surface.
-    /// sun shadows widen with the sun square anyway, bounce light is blurry to begin with
+    /// lod cones (voxels of width per meter) for rays leaving a surface
     pub const SHADOW_CONE: f32 = SUN_SIZE * VOXELS_PER_METER;
     pub const BOUNCE_CONE: f32 = 0.4;
 
-    /// a bounce hit only borrows a face's cached light once it has this many samples
     pub const BORROW_SAMPLES: u32 = 4;
 
     pub fn resize_accumulation_buffer(&mut self, new_x: usize, new_y: usize) {
@@ -154,32 +97,20 @@ impl Engine {
         self.frame_depths = vec![f32::INFINITY; new_x * new_y];
         self.frame_faces = vec![SKY_FACE; new_x * new_y];
 
-        // the face light lives in the world, a new size doesn't change any of it //
         self.frame_accumulation_count = 0;
     }
 
-    /// start the image over and forget all the face light too,
-    /// for stuff that changes how the world looks (sun, lighting), not just where you are
+    /// start over and forget the face light too (sun / lighting changes)
     pub fn restart_image(&mut self) {
         self.frame_accumulation_count = 0;
         self.lights.clear();
     }
 
-    /// traces one more frame into the pixel buffer
-    /// true when every pixel got rewritten, false for a converged frame
+    /// false once a still image has converged
     pub fn render(&mut self, buffer_address: usize) -> bool {
         /*
-            ok so every pixel gets its own camera ray, so whatever you look at stays sharp,
-            but the light comes out of the face light cache (lightcache.rs). the light on a
-            voxel face is the same from wherever you see it, so it's kept per face in the world
-            and only faces that need it get shaded, by whichever lane got to them first.
-            moving the camera never throws any of it away
-
-            moving: rays go through pixel centers, the image is just this frame
-            still: rays get jittered and every pixel keeps a running mean of its color,
-            that's the anti aliasing, the faces keep converging underneath it
-
-            every 16x16 tile runs the stages in Tile on its own thread
+            every pixel gets its own camera ray, the light comes out of the face light cache (lightcache.rs)
+            still frames jitter and keep a running mean, that's the anti aliasing
         */
 
         let moving = self.frame_accumulation_count == 0;
@@ -202,8 +133,7 @@ impl Engine {
         self.frame_index = self.frame_index.wrapping_add(1);
 
         // sub pixel jitter from the r2 sequence, same for the whole frame //
-        // packets stay coherent and the image anti aliases itself as frames pile up.
-        // moving frames go straight through pixel centers, jitter there only makes edges shimmer
+        // moving frames skip it, jitter there only makes edges shimmer
 
         let jitter = if moving {
             (0.0, 0.0)
@@ -220,7 +150,6 @@ impl Engine {
             camera,
             builder: PacketBuilder::new(camera.center, camera.pixel_delta_x, camera.pixel_delta_y),
             jitter,
-            // an eye inside water sees everything through it
             underwater: self.world.water_at(camera.center),
             moving,
             frame,
@@ -255,8 +184,7 @@ impl Engine {
 
         self.faces_lit = self.lights.take_lit();
 
-        // size up the next frame from what this one cost: settled faces get refreshed //
-        // less often when it's slow, more often when there's room (or barely anything got lit)
+        // settled faces refresh less often after a slow frame, more often when there's room //
 
         let ms = start_time.elapsed().as_secs_f32() * 1000.0;
 
@@ -302,7 +230,6 @@ impl Engine {
             });
     }
 
-    /// what one packet of camera rays hits first, an eye under water looks right through it.
     /// nothing's in the way before start (meters), see beam_start
     #[inline(always)]
     fn primary(&self, packet: Packet, underwater: bool, start: f32) -> PacketHit {
@@ -317,17 +244,8 @@ impl Engine {
         }
     }
 
-    /*
-        how far every camera ray of a block can go before it could possibly hit anything
-        (meters). origin + dir is the block's center ray, the block's other rays never get
-        further than spread * t from it
-
-        the center ray marches through the skip map, every meter knows the empty cube around it.
-        as long as the whole fan of rays fits inside the cube it's safe to jump, so each hop
-        goes until the fan's edge would touch a wall. the volume's sides count as walls too,
-        every ray has to start somewhere inside it (above the terrain's top is fine, a ray
-        up there just walks out through empty space)
-    */
+    // how far every camera ray of a block can jump before it could hit anything (meters)
+    // the center ray marches the skip map, each hop goes until the fan of rays would touch a wall
     fn beam_start(&self, origin: Vec3, dir: Vec3, spread: f32, underwater: bool) -> f32 {
         let tree = &self.world.tree;
         let walls = [Tree64::WIDTH; 3];
@@ -362,8 +280,7 @@ impl Engine {
                     (p[a] - lo, hi - p[a])
                 };
 
-                // the fan's edge closes in on the wall ahead at speed + spread, //
-                // and on the wall behind only if it spreads faster than the center leaves it
+                // the fan's edge closes on the wall ahead at speed + spread, behind only if it spreads faster //
                 hop = hop.min((ahead - reach) / (speed + spread));
 
                 if spread > speed {
@@ -381,318 +298,18 @@ impl Engine {
         // a hair short, float rounding never gets to decide //
         (t - 0.01).max(0.0)
     }
-
-    /*
-        what 4 camera rays end up looking at, everything that depends on where you look from:
-        sky, water (reflection ray + refraction ray, mixed by fresnel) and fog under water.
-        whatever surface is left gets its light from the face cache, see render
-    */
-    #[inline(always)]
-    fn view(&self, ray: Packet, surface: PacketHit, underwater: bool, cone: f32) -> View {
-        let tree = &self.world.tree;
-        let sun = &self.world.sun;
-        let offset = SimdF32::from_float(SURFACE_OFFSET);
-
-        let mut surface = surface;
-        let mut ray = ray;
-        let mut throughput = Packed_Vec3_x4::ONES;
-        let mut traveled = surface.distances;
-
-        // rays that get out see the sky and the sun //
-
-        let mut radiance = Packed_Vec3_x4::select(
-            surface.hit,
-            Packed_Vec3_x4::ZEROES,
-            sky_with_sun(ray.directions, sun),
-        );
-
-        // under water everything's seen through the water //
-
-        if underwater {
-            throughput = water_transmission(surface.distances);
-            radiance = (Packed_Vec3_x4::ONES - throughput) * water_scatter(sun);
-        }
-
-        /* WATER */
-
-        let water = water_lanes(surface.materials) & surface.hit;
-        let mut mirror_origins = Packed_Vec3_x4::ZEROES;
-        let mut mirror_dirs = Packed_Vec3_x4::ZEROES;
-        let mut mirror_share = SimdF32::ZEROES;
-
-        if water.has_active() {
-            // water seen from above is always its flat top, past LOD_START the surface gets
-            // lumped into blocks and a ray could catch the side of one, that'd mirror like a wall
-            let n = Packed_Vec3_x4::select(water, splat(Vec3::new(0.0, 1.0, 0.0)), surface.normals);
-            let d = ray.directions;
-            let p = ray.at(surface.distances);
-
-            // schlick fresnel decides how the light splits between the two rays //
-
-            let cos_i = d.dot(n).neg().clamp_to(SimdF32::ZEROES, SimdF32::ONES);
-            let k = SimdF32::ONES - cos_i;
-            let k2 = k * k;
-            let fresnel =
-                (k2 * k2 * k).mul_then_add(SimdF32::from_float(0.98), SimdF32::from_float(0.02));
-
-            // the reflection ray gets traced later, far water doesn't need one for every pixel //
-
-            let mirrored = d.add_scaled(n, d.dot(n) * SimdF32::from_float(-2.0));
-            mirror_origins = p.add_scaled(n, offset);
-            mirror_dirs = mirrored;
-            mirror_share = fresnel;
-
-            // refraction, snell from air into water, eta = 1 / 1.33 //
-            // you see the bottom up to WATER_VISIBILITY, past that it's just water color
-
-            let eta = SimdF32::from_float(1.0 / 1.33);
-            let sin2 = (SimdF32::ONES - cos_i * cos_i) * eta * eta;
-            let cos_t = (SimdF32::ONES - sin2).max(SimdF32::ZEROES).sqrt();
-            let bent = d
-                .scale(eta)
-                .add_scaled(n, eta.mul_then_add(cos_i, cos_t.neg()))
-                .normalize();
-
-            let under_ray = Packet::new(
-                Packed_Vec3_x4::select(water, p.add_scaled(n, offset.neg()), ray.origins),
-                Packed_Vec3_x4::select(water, bent, ray.directions),
-            );
-            let under = tree.trace::<false, true>(
-                under_ray,
-                water,
-                SimdF32::from_float(WATER_VISIBILITY),
-                cone,
-            );
-
-            // whatever light the water eats gets swapped for its own scattered color //
-
-            let transmission = water_transmission(under.distances);
-            let scatter = water_scatter(sun);
-
-            let refracted = SimdF32::ONES - fresnel;
-
-            radiance = Packed_Vec3_x4::select(
-                water,
-                ((Packed_Vec3_x4::ONES - transmission) * scatter).scale(refracted),
-                radiance,
-            );
-            throughput = Packed_Vec3_x4::select(water, transmission.scale(refracted), throughput);
-
-            // from here on the surface to light is whatever the refracted ray found //
-
-            ray = under_ray;
-            traveled = SimdF32::select(water, traveled + under.distances, traveled);
-            surface.hit = (surface.hit & water.not()) | under.hit;
-            surface.distances = SimdF32::select(water, under.distances, surface.distances);
-            surface.normals = Packed_Vec3_x4::select(water, under.normals, surface.normals);
-
-            let water_array = water.to_array();
-            let under_hits = under.hit.to_array();
-
-            for (lane, material) in surface.materials.iter_mut().enumerate() {
-                if water_array[lane] != 0 {
-                    *material = if under_hits[lane] != 0 {
-                        under.materials[lane]
-                    } else {
-                        Material::Air
-                    };
-                }
-            }
-        }
-
-        let p = ray.at(surface.distances);
-
-        View {
-            radiance,
-            base: albedo(surface.materials, p, surface.normals) * throughput,
-            points: p,
-            normals: surface.normals,
-            distances: traveled,
-            lit: surface.hit,
-            water,
-            fresnel: mirror_share,
-            mirror_origins,
-            mirror_dirs,
-        }
-    }
-
-    /// what 4 water lanes see in their reflection, up to WATER_REFLECTION_DISTANCE, sky past that.
-    /// whatever it hits shows the light its face has in the cache, a face that's
-    /// never been on screen just gets the sun without a shadow ray
-    #[inline(always)]
-    fn reflect(&self, origins: Packed_Vec3_x4, dirs: Packed_Vec3_x4) -> Packed_Vec3_x4 {
-        let sun = &self.world.sun;
-        let ray = Packet::new(origins, dirs);
-        let mirror = self.world.tree.trace::<false, true>(
-            ray,
-            SimdU32::ALL_ACTIVE,
-            SimdF32::from_float(WATER_REFLECTION_DISTANCE),
-            Self::CAMERA_CONE,
-        );
-
-        let n = mirror.normals;
-        let p = ray.at(mirror.distances);
-        let (cached, found) = self.cached_light(p, n, mirror.hit, 1);
-        let guessed = splat(sun.rgb).scale(n.dot(splat(sun.dir)).max(SimdF32::ZEROES))
-            + splat(BOUNCE_AMBIENT);
-
-        Packed_Vec3_x4::select(
-            mirror.hit,
-            albedo(mirror.materials, p, n) * Packed_Vec3_x4::select(found, cached, guessed),
-            sky_with_sun(dirs, sun),
-        )
-    }
-
-    /// one light sample for 4 face spots (just off the surface): the sun with a shadow ray,
-    /// plus one cosine bounce. it's the light landing there, the surface color isn't in it
-    #[inline(always)]
-    fn face_light(
-        &self,
-        start: Packed_Vec3_x4,
-        n: Packed_Vec3_x4,
-        rng: &mut Rng,
-    ) -> Packed_Vec3_x4 {
-        let sun = &self.world.sun;
-
-        let to_sun = sun_sample(sun, rng.next(), rng.next());
-        let n_dot_l = n.dot(to_sun).max(SimdF32::ZEROES);
-        let facing = n_dot_l.is_greater_than(SimdF32::ZEROES);
-
-        let shadow = self.world.tree.trace::<true, true>(
-            Packet::new(start, to_sun),
-            facing,
-            SimdF32::INFY,
-            Self::SHADOW_CONE,
-        );
-        let sunlit = facing & shadow.hit.not();
-
-        let direct = Packed_Vec3_x4::select(
-            sunlit,
-            splat(sun.rgb).scale(n_dot_l),
-            Packed_Vec3_x4::ZEROES,
-        );
-
-        direct + self.bounce(start, n, rng)
-    }
-
-    /// light that one cosine bounce brings back, sky if it escapes.
-    /// a hit on a face that's already in the cache just borrows its light (that's every
-    /// bounce after the first, for free), anything else gets the sun with its own shadow ray
-    #[inline(always)]
-    fn bounce(&self, start: Packed_Vec3_x4, n: Packed_Vec3_x4, rng: &mut Rng) -> Packed_Vec3_x4 {
-        let tree = &self.world.tree;
-        let sun = &self.world.sun;
-
-        let bounce_dirs = cosine_sample(n, rng.next(), rng.next());
-
-        // bounce lighting off means nobody traces, everyone just sees open sky //
-
-        if !self.bounce_lighting {
-            return sky(bounce_dirs);
-        }
-
-        let bounce_ray = Packet::new(start, bounce_dirs);
-        let bounce = tree.trace::<false, true>(
-            bounce_ray,
-            SimdU32::ALL_ACTIVE,
-            SimdF32::from_float(Self::BOUNCE_MAX_DISTANCE),
-            Self::BOUNCE_CONE,
-        );
-
-        // escaped bounces pick up the sky dome, the sun was already counted as direct light //
-
-        let indirect = sky(bounce_dirs);
-
-        if bounce.hit.has_none_active() {
-            return indirect;
-        }
-
-        let n2 = bounce.normals;
-        let p2 = bounce_ray.at(bounce.distances);
-        let (cached, found) = self.cached_light(p2, n2, bounce.hit, Self::BORROW_SAMPLES);
-
-        let to_sun = sun_sample(sun, rng.next(), rng.next());
-        let n2_dot_l = n2.dot(to_sun).max(SimdF32::ZEROES);
-        let facing2 = bounce.hit & found.not() & n2_dot_l.is_greater_than(SimdF32::ZEROES);
-
-        let shadow2 = tree.trace::<true, true>(
-            Packet::new(
-                p2.add_scaled(n2, SimdF32::from_float(SURFACE_OFFSET)),
-                to_sun,
-            ),
-            facing2,
-            SimdF32::from_float(Self::BOUNCE_SHADOW_DISTANCE),
-            Self::BOUNCE_CONE,
-        );
-        let sunlit2 = facing2 & shadow2.hit.not();
-
-        let guessed = Packed_Vec3_x4::select(
-            sunlit2,
-            splat(sun.rgb).scale(n2_dot_l),
-            Packed_Vec3_x4::ZEROES,
-        ) + splat(BOUNCE_AMBIENT);
-
-        Packed_Vec3_x4::select(
-            bounce.hit,
-            albedo(bounce.materials, p2, n2) * Packed_Vec3_x4::select(found, cached, guessed),
-            indirect,
-        )
-    }
-
-    /// light the cache has for every hit lane's face (finest patch first),
-    /// and the lanes that had at least min_samples of it
-    #[inline(always)]
-    fn cached_light(
-        &self,
-        points: Packed_Vec3_x4,
-        normals: Packed_Vec3_x4,
-        hit: SimdU32,
-        min_samples: u32,
-    ) -> (Packed_Vec3_x4, SimdU32) {
-        let hits = hit.to_array();
-        let points = lanes(points);
-        let normals = lanes(normals);
-        let mut found = [0u32; 4];
-
-        let light = [0, 1, 2, 3].map(|lane| {
-            if hits[lane] == 0 {
-                return [0.0; 3];
-            }
-
-            let (voxel, face) = face_of(points[lane], normals[lane]);
-
-            for level in 0..4 {
-                if let Some((light, samples)) =
-                    self.lights.lookup(LightCache::key(voxel, face, level))
-                    && samples >= min_samples
-                {
-                    found[lane] = u32::MAX;
-                    return light;
-                }
-            }
-
-            [0.0; 3]
-        });
-
-        (packed(light), SimdU32::from(found))
-    }
 }
 
-/// what every tile needs to know about the frame
 struct Setup {
     camera: Camera,
     builder: PacketBuilder,
-    /// sub pixel offset of every camera ray this frame (pixels)
     jitter: (f32, f32),
     underwater: bool,
     moving: bool,
     frame: u32,
-    /// settled faces get shaded every nth frame, see LightCache::claim
     every: u32,
-    /// render width (pixels)
     width: usize,
-    /// the per pixel buffers and the output, tiles never overlap so every pixel
-    /// is only ever written by one thread
+    /// tiles never overlap, so every pixel is only ever written by one thread
     accumulation: usize,
     depths: usize,
     faces: usize,
@@ -701,30 +318,23 @@ struct Setup {
 
 /// one 16x16 tile, everything on the stack, one thread per tile at a time
 struct Tile {
-    /// top left pixel of the tile
     x0: usize,
     y0: usize,
 
-    /// what every packet of camera rays sees
     views: [View; TILE_PACKETS],
-    /// face (or patch) key every lit lane sees, see LightCache::key
     keys: [[u64; 4]; TILE_PACKETS],
 
     /// lod level of the water every pixel sees, NO_WATER if it doesn't
     water_levels: [[u8; TILE]; TILE],
-    /// reflections of the pixels that traced one
     reflections: [[[f32; 3]; TILE]; TILE],
     traced: [[bool; TILE]; TILE],
 
-    /// face samples waiting to be shaded
     jobs: [Job; TILE_JOBS],
     queued: usize,
 
-    /// faces nobody had light for yet that another tile is busy shading,
-    /// this tile shades them for itself: (key, light sum, samples)
+    /// new faces another tile is busy shading, this tile shades its own copy: (key, light sum, samples)
     privates: [(u64, [f32; 3], f32); TILE_PRIVATES],
     private_count: usize,
-    /// new faces this tile claimed, its own pixels can just wait on those
     claimed: [u64; TILE_PACKETS * 4],
     claimed_count: usize,
 }
@@ -750,8 +360,6 @@ impl Tile {
 
     /* PRIMARY */
 
-    /// every packet's camera rays, what they hit and the water in front of it,
-    /// plus every pixel's view depth and face for the brush preview
     fn primary(&mut self, engine: &Engine, setup: &Setup) {
         let camera = &setup.camera;
         let mut start = 0.0;
@@ -796,12 +404,10 @@ impl Tile {
         }
     }
 
-    /// where every camera ray of the 8x8 block starting at packet k can start walking,
-    /// see Engine::beam_start
+    /// where the camera rays of the 8x8 block at packet k can start walking (see Engine::beam_start)
     fn block_start(&self, engine: &Engine, setup: &Setup, k: usize) -> f32 {
         let camera = &setup.camera;
 
-        // the ray through a pixel (x, y), plus jitter, normalized //
         let ray = |x: f32, y: f32| {
             (camera.pixel_00 + camera.pixel_delta_x * (x + setup.jitter.0)
                 - camera.pixel_delta_y * (y + setup.jitter.1)
@@ -826,9 +432,6 @@ impl Tile {
 
     /* REFLECTIONS */
 
-    /// near water traces a reflection for every pixel, further out only every
-    /// REFLECTION_STEP-th pixel does and the rest blur together the ones around them
-    /// (see reflection). far pixels with none around them (shores) trace their own
     fn reflections(&mut self, engine: &Engine) {
         let mut queue = [(0usize, 0usize); TILE_PACKETS * 4];
         let mut queued = 0;
@@ -880,7 +483,6 @@ impl Tile {
         self.trace_mirrors(engine, &queue[..queued]);
     }
 
-    /// reflection rays for the queued (packet, lane)s, 4 at a time
     fn trace_mirrors(&mut self, engine: &Engine, queue: &[(usize, usize)]) {
         for group in queue.chunks(4) {
             let pick = [0, 1, 2, 3].map(|j| group[j.min(group.len() - 1)]);
@@ -896,9 +498,7 @@ impl Tile {
         }
     }
 
-    /// what a water pixel shows in its reflection: up close its own, further out the traced
-    /// ones on its grid within REFLECTION_BLUR, tent weighted so it fades out smoothly
-    /// (blurrier the further out). None = not water, or nothing traced around it yet
+    /// far out a water pixel blends the traced reflections around it, None = nothing traced yet
     fn reflection(&self, tx: usize, ty: usize) -> Option<[f32; 3]> {
         let level = self.water_levels[ty][tx];
 
@@ -939,15 +539,13 @@ impl Tile {
         if weight > 0.0 {
             Some(total.map(|c| c / weight))
         } else {
-            // a shore pixel that had to trace its own //
             self.traced[ty][tx].then_some(self.reflections[ty][tx])
         }
     }
 
     /* FACES */
 
-    /// which face (or patch) each lit lane sees, and who has to shade what.
-    /// neighbors mostly see the same face, those don't even ask
+    /// which face each lit lane sees, neighbors on the same face don't even ask
     fn faces(&mut self, engine: &Engine, setup: &Setup) {
         let mut last = 0u64;
 
@@ -1026,7 +624,6 @@ impl Tile {
 
     /* SHADE FACES */
 
-    /// every queued face sample, 4 at a time so no simd lane sits around idle
     fn shade(&mut self, engine: &Engine, setup: &Setup) {
         for group in self.jobs[..self.queued].chunks(4) {
             // short groups just repeat their last job //
@@ -1034,8 +631,6 @@ impl Tile {
 
             let mut rng = Rng::new(SimdU32::from(pick.map(|job| job.seed)), setup.frame);
             let (u1, u2) = (rng.next().to_array(), rng.next().to_array());
-
-            // a random spot on the face, just off it //
 
             let mut starts = [[0.0f32; 3]; 4];
             let mut normals = [[0.0f32; 3]; 4];
@@ -1072,9 +667,7 @@ impl Tile {
 
     /* COMPOSE + DISPLAY */
 
-    /// every pixel's surface times its face light, plus whatever got there without
-    /// touching a lit surface and any reflection. still frames keep a running mean,
-    /// then the whole tile gets tone mapped into the pixel buffer
+    /// surface times face light, plus reflections, tone mapped into the pixel buffer
     fn compose(&self, engine: &Engine, setup: &Setup) {
         for k in 0..TILE_PACKETS {
             let view = &self.views[k];
@@ -1111,7 +704,6 @@ impl Tile {
             for (lane, color) in colors.iter().enumerate() {
                 let (tx, ty) = lane_xy(k, lane);
 
-                // water gets its reflection on top //
                 let color = match self.reflection(tx, ty) {
                     Some(mirror) => [0, 1, 2].map(|c| mirror[c].mul_add(fresnel[lane], color[c])),
                     None => *color,
@@ -1137,8 +729,6 @@ impl Tile {
                 };
             }
         }
-
-        // tone map the tile's means straight out of the accumulation buffer, 4 at a time //
 
         for ty in 0..TILE {
             let index = (self.y0 + ty) * setup.width + self.x0;
@@ -1166,7 +756,7 @@ const SKY_FACE: u8 = 255;
 
 /// which of the 6 axis faces a voxel normal is, sky gets its own
 #[inline(always)]
-fn face_id(n: [f32; 3], hit: bool) -> u8 {
+pub(super) fn face_id(n: [f32; 3], hit: bool) -> u8 {
     if !hit {
         return SKY_FACE;
     }
@@ -1181,10 +771,9 @@ fn face_id(n: [f32; 3], hit: bool) -> u8 {
     axis * 2 + (n[axis as usize] > 0.0) as u8
 }
 
-/// the voxel a hit point (meters, on the face) belongs to and which face of it,
 /// half a voxel back against the normal lands inside the voxel
 #[inline(always)]
-fn face_of(p: [f32; 3], n: [f32; 3]) -> ([u32; 3], u8) {
+pub(super) fn face_of(p: [f32; 3], n: [f32; 3]) -> ([u32; 3], u8) {
     let voxel = [0, 1, 2].map(|a| {
         ((p[a] - n[a] * 0.5 * VOXEL_SIZE) * VOXELS_PER_METER)
             .floor()
@@ -1194,24 +783,22 @@ fn face_of(p: [f32; 3], n: [f32; 3]) -> ([u32; 3], u8) {
     (voxel, face_id(n, true))
 }
 
-/// rung of a ladder something this far away (meters) is on, 0 = full res up to start,
-/// then 1, 2, 3 each twice as far as the last. light patches climb it from LOD_START
-/// (2^level voxels wide), the reflection grid from WATER_REFLECTION_DISTANCE
+/// lod rung for a distance (meters): 0 up to start, then one more every time it doubles
 #[inline(always)]
-fn ladder(distance: f32, start: f32) -> u32 {
+pub(super) fn ladder(distance: f32, start: f32) -> u32 {
     (distance >= start) as u32 + (distance >= start * 2.0) as u32 + (distance >= start * 4.0) as u32
 }
 
 /// a packet split into its 4 [x, y, z] lanes
 #[inline(always)]
-fn lanes(v: Packed_Vec3_x4) -> [[f32; 3]; 4] {
+pub(super) fn lanes(v: Packed_Vec3_x4) -> [[f32; 3]; 4] {
     let (x, y, z) = (v.xs.to_array(), v.ys.to_array(), v.zs.to_array());
     [0, 1, 2, 3].map(|i| [x[i], y[i], z[i]])
 }
 
 /// 4 [x, y, z] lanes packed back up
 #[inline(always)]
-fn packed(lanes: [[f32; 3]; 4]) -> Packed_Vec3_x4 {
+pub(super) fn packed(lanes: [[f32; 3]; 4]) -> Packed_Vec3_x4 {
     Packed_Vec3_x4::new(
         lanes.map(|v| v[0]),
         lanes.map(|v| v[1]),
@@ -1219,7 +806,7 @@ fn packed(lanes: [[f32; 3]; 4]) -> Packed_Vec3_x4 {
     )
 }
 
-/// top left pixel of the k-th packet in its tile (relative), packets go in morton order:
+/// top left pixel of packet k in its tile, morton order:
 /// bits 0, 2, 4 of k are x, bits 1, 3, 5 are y, in 2 pixel steps
 #[inline(always)]
 const fn packet_xy(k: usize) -> (usize, usize) {
@@ -1228,7 +815,6 @@ const fn packet_xy(k: usize) -> (usize, usize) {
     (x * 2, y * 2)
 }
 
-/// pixel (relative to its tile) of a packet's lane, lanes go left right, top bottom
 #[inline(always)]
 const fn lane_xy(k: usize, lane: usize) -> (usize, usize) {
     let (x, y) = packet_xy(k);
@@ -1270,8 +856,6 @@ mod tests {
         };
 
         let (mut packets, mut skipped) = (0, 0.0);
-
-        // cameras all over, high up and skimming the ground, looking every which way //
 
         for view in 0..90 {
             let height_above = [2.0, 40.0, 150.0][view % 3];
@@ -1342,7 +926,6 @@ mod tests {
             }
         }
 
-        // and it actually skips something //
         println!(
             "{packets} packets, {:.1}m skipped on average",
             skipped / packets as f32
@@ -1352,8 +935,6 @@ mod tests {
 
     #[test]
     fn test_faces_and_patches() {
-        // a point on the top face of voxel (10, 20, 30) //
-
         let top = [
             (10.0 + 0.3) * VOXEL_SIZE,
             21.0 * VOXEL_SIZE,
@@ -1364,8 +945,6 @@ mod tests {
         // same spot seen from below is the voxel above's bottom face //
         assert_eq!(face_of(top, [0.0, -1.0, 0.0]), ([10, 21, 30], 2));
 
-        // the lod ladder: full res up close, then twice as coarse every time the distance doubles //
-
         let lod = |d: f32| ladder(d, Engine::LOD_START);
         assert_eq!(lod(0.5), 0);
         assert_eq!(lod(23.9), 0);
@@ -1374,8 +953,6 @@ mod tests {
         assert_eq!(lod(95.0), 2);
         assert_eq!(lod(96.0), 3);
         assert_eq!(lod(1000.0), 3);
-
-        // reflections keep their own ladder, full res out to where they stop //
 
         assert_eq!(ladder(31.9, WATER_REFLECTION_DISTANCE), 0);
         assert_eq!(ladder(32.0, WATER_REFLECTION_DISTANCE), 1);

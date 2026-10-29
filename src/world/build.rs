@@ -369,8 +369,7 @@ impl Tree64 {
         Cell::Mixed(Branch::EMPTY)
     }
 
-    /// redo everything that's derived from a leaf's voxels: which 2x2x2 blocks have
-    /// anything in them, what each block looks like from afar, and its water bit
+    /// redo a leaf's block masks, far away block materials and water bit
     pub fn refresh_leaf(&mut self, index: usize) {
         let leaf = &self.leaves[index];
         let brick = &self.bricks[index];

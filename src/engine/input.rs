@@ -1,28 +1,128 @@
-pub mod activity;
-pub mod commands;
-pub mod default_keymap;
-pub mod handler;
-pub mod keymap;
-pub mod util;
-
-use crate::engine::input::commands::*;
 use crate::engine::player::GaitState;
 use crate::world::voxel::{Material, VOXELS_PER_METER};
+use winit::event::MouseButton;
+use winit::keyboard::KeyCode;
 
 use super::*;
+
+// every action is one bit: held = down now, pressed = went down since last frame
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Forward,
+    Back,
+    Left,
+    Right,
+    Sprint,
+    Jump,
+    Sneak,
+    /// middle click picks up what you're looking at
+    Break,
+    Place,
+    Pick,
+    BrushGrow,
+    BrushShrink,
+    HandNext,
+    HandBack,
+    Overlay,
+    Perf,
+    Menu,
+    Escape,
+    Fullscreen,
+}
+
+impl Action {
+    pub fn from_key(key: KeyCode) -> Option<Self> {
+        Some(match key {
+            KeyCode::KeyW => Self::Forward,
+            KeyCode::KeyS => Self::Back,
+            KeyCode::KeyA => Self::Left,
+            KeyCode::KeyD => Self::Right,
+            KeyCode::ShiftLeft => Self::Sprint,
+            KeyCode::Space => Self::Jump,
+            KeyCode::KeyC => Self::Sneak,
+            KeyCode::ArrowRight => Self::HandNext,
+            KeyCode::ArrowLeft => Self::HandBack,
+            KeyCode::Digit1 => Self::Overlay,
+            KeyCode::Digit2 => Self::Perf,
+            KeyCode::Digit3 => Self::Menu,
+            KeyCode::Escape => Self::Escape,
+            KeyCode::Digit0 => Self::Fullscreen,
+            _ => return None,
+        })
+    }
+
+    pub fn from_button(button: MouseButton) -> Option<Self> {
+        Some(match button {
+            MouseButton::Left => Self::Break,
+            MouseButton::Right => Self::Place,
+            MouseButton::Middle => Self::Pick,
+            _ => return None,
+        })
+    }
+
+    #[inline(always)]
+    const fn bit(self) -> u32 {
+        1 << self as u32
+    }
+}
+
+pub struct Input {
+    held: u32,
+    pressed: u32,
+    /// raw motion of the last mouse event (device units)
+    pub mouse_motion: (f64, f64),
+    pub mouse_sensitivity: f64,
+}
+
+impl Input {
+    pub const fn new() -> Self {
+        Self {
+            held: 0,
+            pressed: 0,
+            mouse_motion: (0.0, 0.0),
+            mouse_sensitivity: 0.004,
+        }
+    }
+
+    /// only the first down counts as a press, so os key repeat never does
+    pub fn set(&mut self, action: Action, down: bool) {
+        let bit = action.bit();
+
+        if down {
+            self.pressed |= bit & !self.held;
+            self.held |= bit;
+        } else {
+            self.held &= !bit;
+        }
+    }
+
+    /// a press without a release, the scroll wheel
+    pub fn tap(&mut self, action: Action) {
+        self.pressed |= action.bit();
+    }
+
+    #[inline(always)]
+    pub fn is_held(&self, action: Action) -> bool {
+        self.held & action.bit() != 0
+    }
+
+    #[inline(always)]
+    pub fn was_pressed(&self, action: Action) -> bool {
+        self.pressed & action.bit() != 0
+    }
+
+    pub fn end_frame(&mut self) {
+        self.pressed = 0;
+    }
+}
 
 impl Engine {
     /// everything the keys and mouse do this frame:
     /// ui toggles, looking around, then moving the player through the world
     pub fn handle_input(&mut self, dt: f32) {
-        self.input.process(dt);
-        self.input.activity.print_maybe();
-
-        if self
-            .input
-            .activity
-            .was_pressed(DeveloperCommands::ToggleFullscreen.into())
-        {
+        if self.input.was_pressed(Action::Fullscreen) {
             self.set_fullscreen = !self.set_fullscreen;
         }
 
@@ -32,7 +132,7 @@ impl Engine {
         // gravity still runs though
 
         let (wish, gait, tapped, swim) = if self.ui.menu {
-            self.input.last_mouse_motion = (0.0, 0.0);
+            self.input.mouse_motion = (0.0, 0.0);
             (Vec3::DEFAULT, GaitState::Still, false, false)
         } else {
             self.mouse_motion();
@@ -61,22 +161,20 @@ impl Engine {
         }
     }
 
-    /// left click breaks, right click places what's in hand, both repeat while held.
-    /// scroll sizes the brush, arrows cycle the hand, middle click picks up the target
     fn edit_input(&mut self, dt: f32) {
-        let activity = &self.input.activity;
+        let input = &self.input;
         let player = &mut self.player;
 
-        if activity.was_pressed(PlayerCommands::BrushGrow.into()) {
+        if input.was_pressed(Action::BrushGrow) {
             player.brush = (player.brush + 1).min(World::BRUSH_MAX);
         }
 
-        if activity.was_pressed(PlayerCommands::BrushShrink.into()) {
+        if input.was_pressed(Action::BrushShrink) {
             player.brush = (player.brush - 1).max(1);
         }
 
-        let cycle = activity.was_pressed(InventoryCommands::Next.into()) as i32
-            - activity.was_pressed(InventoryCommands::Back.into()) as i32;
+        let cycle =
+            input.was_pressed(Action::HandNext) as i32 - input.was_pressed(Action::HandBack) as i32;
 
         if cycle != 0 {
             let at = Player::HAND
@@ -90,18 +188,16 @@ impl Engine {
             return;
         };
 
-        if activity.was_pressed(PlayerCommands::Select.into()) {
+        if input.was_pressed(Action::Pick) {
             player.hand = target.material;
         }
 
         // a fresh click goes off right away, holding it repeats every EDIT_REPEAT //
 
-        let carve = activity.is_held(PlayerCommands::Destroy.into());
-        let place = activity.is_held(PlayerCommands::Interact.into());
+        let carve = input.is_held(Action::Break);
+        let place = input.is_held(Action::Place);
 
-        if activity.was_pressed(PlayerCommands::Destroy.into())
-            || activity.was_pressed(PlayerCommands::Interact.into())
-        {
+        if input.was_pressed(Action::Break) || input.was_pressed(Action::Place) {
             player.edit_cooldown = 0.0;
         }
 
@@ -121,8 +217,7 @@ impl Engine {
             (!(player.noclip && player.flying())).then(|| Player::hitbox(player.position));
 
         if self.world.edit(center, player.brush, material, keep_out) {
-            // faces around it (and a meter more for shadows / bounce) go back to being young, //
-            // they re-light over the next few frames, everything else keeps its light
+            // faces around it (plus a meter for shadows / bounce) go back to young //
 
             let reach = player.brush as f32 * 0.5 + VOXELS_PER_METER;
             let lo = [0, 1, 2].map(|a| (center[a] - reach).floor() as i32);
@@ -139,10 +234,10 @@ impl Engine {
     /// the move the keys ask for this frame (meters), how it's being asked,
     /// and space tapped / held
     fn wish_move(&self, dt: f32) -> (Vec3, GaitState, bool, bool) {
-        let is_held = |cmd| self.input.activity.is_held(cmd) as i32 as f32;
+        let is_held = |action| self.input.is_held(action) as i32 as f32;
 
         let base_speed = 3.0 * dt;
-        let sprint = is_held(PlayerCommands::Sprint.into());
+        let sprint = is_held(Action::Sprint);
         let modified_speed = (sprint * base_speed) + base_speed;
 
         let mut front = self.camera.front;
@@ -157,12 +252,10 @@ impl Engine {
             right = right.normalize();
         }
 
-        let z_move = is_held(PlayerCommands::MoveForward.into())
-            - is_held(PlayerCommands::MoveBackward.into());
-        let x_move =
-            is_held(PlayerCommands::MoveRight.into()) - is_held(PlayerCommands::MoveLeft.into());
-        let jump = is_held(PlayerCommands::Jump.into());
-        let sneak = is_held(PlayerCommands::Sneak.into());
+        let z_move = is_held(Action::Forward) - is_held(Action::Back);
+        let x_move = is_held(Action::Right) - is_held(Action::Left);
+        let jump = is_held(Action::Jump);
+        let sneak = is_held(Action::Sneak);
 
         let mut movement = (front * z_move) + (right * x_move);
 
@@ -182,7 +275,7 @@ impl Engine {
             GaitState::Walking
         };
 
-        let tapped = self.input.activity.was_pressed(PlayerCommands::Jump.into());
+        let tapped = self.input.was_pressed(Action::Jump);
 
         (movement, gait, tapped, jump > 0.0)
     }
@@ -191,8 +284,8 @@ impl Engine {
         let yaw = self.camera.yaw;
         let pitch = self.camera.pitch;
 
-        let dx = self.input.last_mouse_motion.0 * self.input.mouse_sensitivity;
-        let dy = self.input.last_mouse_motion.1 * self.input.mouse_sensitivity;
+        let dx = self.input.mouse_motion.0 * self.input.mouse_sensitivity;
+        let dy = self.input.mouse_motion.1 * self.input.mouse_sensitivity;
 
         if dx.abs() > 0.0001 || dy.abs() > 0.0001 {
             self.frame_accumulation_count = 0;
@@ -200,6 +293,6 @@ impl Engine {
             self.camera.yaw = yaw + dx as f32;
         }
 
-        self.input.last_mouse_motion = (0.0, 0.0);
+        self.input.mouse_motion = (0.0, 0.0);
     }
 }

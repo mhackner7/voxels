@@ -18,7 +18,7 @@ pub struct World {
 }
 
 impl World {
-    /// a freshly generated world, no cache involved (the tests use this)
+    /// fresh world, no cache (for tests)
     #[cfg(test)]
     pub fn new() -> Self {
         World {
@@ -31,6 +31,4 @@ impl World {
     pub fn set_sun(&mut self, azimuth: f32, elevation: f32) {
         self.sun = Sun::new(azimuth, elevation);
     }
-
-    pub fn update(&mut self, _dt: f32) {}
 }

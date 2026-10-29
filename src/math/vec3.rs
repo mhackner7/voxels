@@ -1,4 +1,3 @@
-use std::mem::{size_of, transmute};
 use std::ops::{
     Add, AddAssign, Div, DivAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign,
 };
@@ -9,31 +8,9 @@ pub struct Vec3 {
     pub data: [f32; 3],
 }
 
-pub const fn v3(x: f32, y: f32, z: f32) -> Vec3 {
-    Vec3::new(x, y, z)
-}
-
 impl Vec3 {
-    const SIZEOF: usize = size_of::<Self>();
-
-    const AXIS_MASKS: [Self; 3] = [
-        Self::new(1.0, 0.0, 0.0),
-        Self::new(0.0, 1.0, 0.0),
-        Self::new(0.0, 0.0, 1.0),
-    ];
-
-    #[inline(always)]
-    pub const fn axis_mask(axis: usize) -> Self {
-        Self::AXIS_MASKS[axis]
-    }
-
     pub const DEFAULT: Vec3 = Self::new(0.0, 0.0, 0.0);
-    pub const X_POS_NORMAL: Vec3 = Self::new(1.0, 0.0, 0.0);
-    pub const X_NEG_NORMAL: Vec3 = Self::new(-1.0, 0.0, 0.0);
     pub const Y_POS_NORMAL: Vec3 = Self::new(0.0, 1.0, 0.0);
-    pub const Y_NEG_NORMAL: Vec3 = Self::new(0.0, -1.0, 0.0);
-    pub const Z_POS_NORMAL: Vec3 = Self::new(0.0, 0.0, 1.0);
-    pub const Z_NEG_NORMAL: Vec3 = Self::new(0.0, 0.0, -1.0);
 
     #[inline(always)]
     pub fn normalize(self) -> Self {
@@ -43,17 +20,6 @@ impl Vec3 {
     #[inline(always)]
     pub fn at(self, axis: usize) -> f32 {
         self.data[axis]
-    }
-
-    #[inline(always)]
-    pub fn fix_nan(mut self) -> Self {
-        for value in &mut self.data {
-            if value.is_nan() {
-                *value = f32::INFINITY;
-            }
-        }
-
-        self
     }
 
     #[inline(always)]
@@ -110,28 +76,6 @@ impl Vec3 {
     }
 
     #[inline(always)]
-    pub fn max_axis(self) -> usize {
-        if self.data[0] > self.data[1] {
-            if self.data[0] > self.data[2] { 0 } else { 2 }
-        } else if self.data[1] > self.data[2] {
-            1
-        } else {
-            2
-        }
-    }
-
-    #[inline(always)]
-    pub fn min_axis(self) -> usize {
-        if self.data[0] < self.data[1] {
-            if self.data[0] < self.data[2] { 0 } else { 2 }
-        } else if self.data[1] < self.data[2] {
-            1
-        } else {
-            2
-        }
-    }
-
-    #[inline(always)]
     pub fn split(self) -> (f32, f32, f32) {
         (self.data[0], self.data[1], self.data[2])
     }
@@ -172,11 +116,6 @@ impl Vec3 {
         Self {
             data: [self.data[0].abs(), self.data[1].abs(), self.data[2].abs()],
         }
-    }
-
-    #[inline(always)]
-    pub const fn serialize(self) -> [u8; Self::SIZEOF] {
-        unsafe { transmute(self) }
     }
 }
 

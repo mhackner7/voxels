@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod input;
 pub mod lightcache;
+pub mod lighting;
 pub mod player;
 pub mod rendering;
 pub mod shading;
@@ -11,7 +12,7 @@ use crate::math::vec3::Vec3;
 use crate::world::World;
 use crate::world::edit::Target;
 use camera::Camera;
-use input::handler::Handler;
+use input::Input;
 use lightcache::LightCache;
 use player::Player;
 use ui::Ui;
@@ -24,9 +25,7 @@ pub struct Engine {
     pub render_width: usize,
     pub render_height: usize,
 
-    /// TIME
     pub last_time: std::time::Instant,
-    pub time_accumulator: f32,
     pub fps_time_accumulator: f32,
     pub frame_count: f32,
     pub smooth_fps: f32,
@@ -43,11 +42,9 @@ pub struct Engine {
     pub bounce_lighting: bool,
     /// index into FRAME_BUDGETS: 60 fps, 30 fps, no target
     pub fps_target: usize,
-    /// settled faces get re-lit every nth frame, the frame budget walks this up and down
+    /// settled faces get re-lit every nth frame, the frame budget moves it
     pub every: u32,
-    /// frames since the camera last moved
     pub samples: f32,
-    /// face light samples shaded last frame
     pub faces_lit: u32,
 
     /// milliseconds the last frame spent tracing / presenting
@@ -57,13 +54,12 @@ pub struct Engine {
     pub ui: Ui,
     pub usage: Usage,
 
-    /// running mean color of every pixel (linear rgb) + frames in it, anti aliasing only
+    /// running mean color per pixel (linear rgb) + frames in it
     pub frame_accumulation_buffer: Vec<[f32; 4]>,
     /// view depth (meters along the camera front) of each pixel's first hit, infinity = sky
     pub frame_depths: Vec<f32>,
     /// which voxel face each pixel sees (0..6, 255 = sky)
     pub frame_faces: Vec<u8>,
-    /// the light on every voxel face that's been on screen, kept in the world
     pub lights: LightCache,
     /// samples in the accumulation buffer, 0 = the next frame overwrites it
     pub frame_accumulation_count: u32,
@@ -71,10 +67,9 @@ pub struct Engine {
     pub frame_index: u32,
 
     pub camera: Camera,
-    pub input: Handler,
+    pub input: Input,
     pub player: Player,
     pub world: World,
-    /// the voxel under the crosshair (within reach), None = nothing to edit
     pub target: Option<Target>,
 }
 
@@ -82,46 +77,16 @@ impl Engine {
     /// number of pixels along tile axis
     pub const PIXELS_PER_TILE_AXIS: usize = 16;
 
-    /// 64 ticks per second
-    pub const TICK_RATE: f32 = 64.0;
-    /// in microseconds -> 1 / 64 seconds = 15625 micro seconds
-    pub const TICK_LENGTH: f32 = 1.0 / Self::TICK_RATE;
-
-    /// 250ms
+    /// longest frame the simulation steps over at once (seconds)
     pub const MAX_FRAME_TIME: f32 = 0.25;
 
     /// render_rows choices of the dev menu, multiples of the tile size
     pub const RENDER_ROWS: [usize; 4] = [352, 528, 720, 1088];
 
-    /// the world comes in already built (or loaded), see World::load_or_build
     pub fn new(render_width: usize, render_height: usize, world: World) -> Self {
-        println!("[Engine] Initializing render pipeline...");
-        println!(
-            "[Engine] Framebuffer: {}x{} ({} pixels, Morton tile size: {}x{})",
-            render_width,
-            render_height,
-            render_width * render_height,
-            Self::PIXELS_PER_TILE_AXIS,
-            Self::PIXELS_PER_TILE_AXIS
-        );
-
         let camera_pos = Vec3::new(128.0, 160.0, -20.0);
         let look_target = Vec3::new(128.0, 112.0, 128.0);
         let aspect_ratio = render_width as f32 / render_height as f32;
-
-        println!(
-            "[Engine] Initializing Camera at pos [{:.1}, {:.1}, {:.1}], target [{:.1}, {:.1}, {:.1}]",
-            camera_pos.data[0],
-            camera_pos.data[1],
-            camera_pos.data[2],
-            look_target.data[0],
-            look_target.data[1],
-            look_target.data[2],
-        );
-        println!(
-            "[Engine] Camera FOV: 75.0 deg, aspect ratio: {:.3}",
-            aspect_ratio
-        );
 
         let mut camera = Camera::new(
             camera_pos,
@@ -138,14 +103,13 @@ impl Engine {
             render_width,
             render_height,
             last_time: std::time::Instant::now(),
-            time_accumulator: 0.0,
             fps_time_accumulator: 0.0,
             frame_count: 0.0,
             smooth_fps: 0.0,
             camera,
-            player: Player::new("player1", camera_pos),
+            player: Player::new(camera_pos),
             world,
-            input: Default::default(),
+            input: Input::new(),
             set_fullscreen: false,
             render_rows: render_height,
             resize_render: false,
@@ -198,18 +162,6 @@ impl Engine {
 
         self.handle_input(delta_time);
 
-        self.world.update(delta_time);
-
-        // fixed tick loop //
-
-        self.time_accumulator += delta_time;
-
-        while self.time_accumulator >= Self::TICK_LENGTH {
-            self.time_accumulator -= Self::TICK_LENGTH;
-        }
-
-        // let interpolation_alpha = self.time_accumulator as f64 / Self::TICK_LENGTH as f64;
-
         // render to pixel buffer //
 
         let render_start = std::time::Instant::now();
@@ -224,9 +176,9 @@ impl Engine {
 
         self.draw_ui(buffer_address);
 
-        // frame cleanup //
+        // presses only count for the frame they happened in //
 
-        self.cleanup();
+        self.input.end_frame();
     }
 
     /// new render size in pixels (multiples of the tile size), restarts accumulation
@@ -239,17 +191,5 @@ impl Engine {
         self.camera.render_height = height;
         self.camera.aspect_ratio = width as f32 / height as f32;
         self.camera.update();
-    }
-
-    // pub fn tick(&mut self) {}
-
-    // pub fn shutdown(&mut self) {}
-
-    // pub fn save(&mut self) {}
-
-    // pub fn load(&mut self) {}
-
-    pub fn cleanup(&mut self) {
-        self.input.activity.cleanup();
     }
 }

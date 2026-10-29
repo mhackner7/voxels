@@ -26,31 +26,6 @@ impl Packed_Vec3_x4 {
         zs: SimdF32::ONES,
     };
 
-    pub const NEGS: Self = Self {
-        xs: SimdF32::NEGS,
-        ys: SimdF32::NEGS,
-        zs: SimdF32::NEGS,
-    };
-
-    #[inline(always)]
-    /// makes a new Packed_Vec3_x4 from one SimdF32 in all slots
-    pub const fn stretched(vec: SimdF32) -> Self {
-        Self {
-            xs: vec,
-            ys: vec,
-            zs: vec,
-        }
-    }
-
-    #[inline(always)]
-    pub const fn float(val: f32) -> Self {
-        Self {
-            xs: SimdF32::from_float(val),
-            ys: SimdF32::from_float(val),
-            zs: SimdF32::from_float(val),
-        }
-    }
-
     #[inline(always)]
     pub fn new(xs: [f32; 4], ys: [f32; 4], zs: [f32; 4]) -> Self {
         Self {
@@ -77,60 +52,15 @@ impl Packed_Vec3_x4 {
         }
     }
 
+    /// [xs, ys, zs]
     #[inline(always)]
-    /// get 1.0 for positive and -1.0 for negative
-    pub fn signs(self) -> Self {
-        Self {
-            xs: self.xs.signs(),
-            ys: self.ys.signs(),
-            zs: self.zs.signs(),
-        }
+    pub fn axes(self) -> [SimdF32; 3] {
+        [self.xs, self.ys, self.zs]
     }
 
     #[inline(always)]
-    /// get absolute values for each
-    pub fn abs(self) -> Self {
-        Self {
-            xs: self.xs.abs(),
-            ys: self.ys.abs(),
-            zs: self.zs.abs(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn floor(self) -> Self {
-        Self {
-            xs: self.xs.floor(),
-            ys: self.ys.floor(),
-            zs: self.zs.floor(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn min(self, other: Self) -> Self {
-        Self {
-            xs: self.xs.min(other.xs),
-            ys: self.ys.min(other.ys),
-            zs: self.zs.min(other.zs),
-        }
-    }
-
-    #[inline(always)]
-    pub fn max(self, other: Self) -> Self {
-        Self {
-            xs: self.xs.max(other.xs),
-            ys: self.ys.max(other.ys),
-            zs: self.zs.max(other.zs),
-        }
-    }
-
-    #[inline(always)]
-    pub fn clamp_to(self, min: Self, max: Self) -> Self {
-        Self {
-            xs: self.xs.clamp_to(min.xs, max.xs),
-            ys: self.ys.clamp_to(min.ys, max.ys),
-            zs: self.zs.clamp_to(min.zs, max.zs),
-        }
+    pub fn from_axes([xs, ys, zs]: [SimdF32; 3]) -> Self {
+        Self { xs, ys, zs }
     }
 
     #[inline(always)]
@@ -165,15 +95,6 @@ impl Packed_Vec3_x4 {
     }
 
     #[inline(always)]
-    pub fn neg(self) -> Self {
-        Self {
-            xs: self.xs.neg(),
-            ys: self.ys.neg(),
-            zs: self.zs.neg(),
-        }
-    }
-
-    #[inline(always)]
     /// select -> cond ? true : false, per lane
     pub fn select(condition_mask: SimdU32, if_true: Self, if_false: Self) -> Self {
         Self {
@@ -182,32 +103,11 @@ impl Packed_Vec3_x4 {
             zs: SimdF32::select(condition_mask, if_true.zs, if_false.zs),
         }
     }
-
-    #[inline(always)]
-    /// (mul1 * mul2) + add
-    fn mul_add(mul1: Self, mul2: Self, add: Self) -> Self {
-        Self {
-            xs: SimdF32::mul_add(add.xs, mul1.xs, mul2.xs),
-            ys: SimdF32::mul_add(add.ys, mul1.ys, mul2.ys),
-            zs: SimdF32::mul_add(add.zs, mul1.zs, mul2.zs),
-        }
-    }
-
-    #[inline(always)]
-    /// self + (mul1 * mul2)
-    pub fn add_to_product(self, mul1: Self, mul2: Self) -> Self {
-        Self::mul_add(mul1, mul2, self)
-    }
-
-    #[inline(always)]
-    /// (self * mul2) + add
-    pub fn mul_then_add(self, mul: Self, add: Self) -> Self {
-        Self::mul_add(self, mul, add)
-    }
 }
 
 impl Add<Self> for Packed_Vec3_x4 {
     type Output = Self;
+    #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         Self {
             xs: self.xs + rhs.xs,
@@ -219,6 +119,7 @@ impl Add<Self> for Packed_Vec3_x4 {
 
 impl Sub<Self> for Packed_Vec3_x4 {
     type Output = Self;
+    #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         Self {
             xs: self.xs - rhs.xs,
@@ -230,6 +131,7 @@ impl Sub<Self> for Packed_Vec3_x4 {
 
 impl Mul<Self> for Packed_Vec3_x4 {
     type Output = Self;
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self::Output {
         Self {
             xs: self.xs * rhs.xs,

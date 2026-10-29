@@ -447,13 +447,13 @@ impl Terrain {
         let in_lake =
             |i: usize| lake_level[i] - h[i] > Self::LAKE_MIN_DEPTH && h[i] > Self::SEA_LEVEL;
 
-        for i in 0..HYDRO * HYDRO {
+        for (i, &level) in lake_level.iter().enumerate() {
             if !in_lake(i) {
                 continue;
             }
 
             let (x, z) = ((i % HYDRO) as f32, (i / HYDRO) as f32);
-            Self::rasterize_square(ground, lakes, x, z, lake_level[i]);
+            Self::rasterize_square(ground, lakes, x, z, level);
         }
 
         // streams, lowest cells first so a stream only shows up below a gentle path //

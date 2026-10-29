@@ -118,9 +118,8 @@ impl Tree64 {
         self.trace_from::<ANY_HIT, SKIP_WATER>(packet, active, max_ts, cone, 0.0)
     }
 
-    /// trace, but every lane starts walking at start (meters along the ray) instead of
-    /// where it enters the volume. the caller promises there's nothing to hit before that,
-    /// and that every lane is still inside the volume there (see Engine::beam_start)
+    /// trace starting at start (meters), the caller promises nothing's in the way before that
+    /// and every lane is still inside the volume (see Engine::beam_start)
     #[inline(always)]
     pub fn trace_from<const ANY_HIT: bool, const SKIP_WATER: bool>(
         &self,
@@ -200,10 +199,8 @@ struct PacketWalk {
     ts: SimdF32,
     max_ts: SimdF32,
 
-    /// integer voxel coords (0..2047), always inside the current cell
-    xs: SimdI32,
-    ys: SimdI32,
-    zs: SimdI32,
+    /// integer voxel coords (0..2047) per axis, always inside the current cell
+    voxels: [SimdI32; 3],
 
     /// current depth per lane
     depths: SimdI32,
@@ -216,22 +213,18 @@ struct PacketWalk {
     /// per ray traversal stack, [depth] = node index at that depth, 0 is the root
     node_stack: [[u32; Tree64::VOXEL_DEPTH + 1]; 4],
 
-    /// all ones in the lanes that step towards +axis
-    pos_xs: SimdU32,
-    pos_ys: SimdU32,
-    pos_zs: SimdU32,
+    /// per axis: all ones in the lanes that step towards +axis
+    pos: [SimdU32; 3],
 
-    /// axis crossed by the last step, it is the hit normal
-    last_xs: SimdU32,
-    last_ys: SimdU32,
-    last_zs: SimdU32,
+    /// per axis: crossed by the last step, that's the hit normal
+    last: [SimdU32; 3],
 
     /// origins / directions in voxel space, exit voxel = floor(o_v + d_v * t)
-    voxel_origins: Packed_Vec3_x4,
-    voxel_dirs: Packed_Vec3_x4,
+    voxel_origins: [SimdF32; 3],
+    voxel_dirs: [SimdF32; 3],
 
     /// VOXEL_SIZE * inv_dir
-    scaled_invs: Packed_Vec3_x4,
+    scaled_invs: [SimdF32; 3],
 }
 
 impl PacketWalk {
@@ -258,15 +251,12 @@ impl PacketWalk {
 
         // the axis of the slab the ray entered through is the first normal //
 
-        let near = |o: SimdF32, inv: SimdF32, max: SimdF32| (o.neg() * inv).min((max - o) * inv);
+        let (o, inv, max) = (origins.axes(), inverse_dirs.axes(), tree.bmax.axes());
+        let near = per_axis(|a| (o[a].neg() * inv[a]).min((max[a] - o[a]) * inv[a]));
 
-        let near_xs = near(origins.xs, inverse_dirs.xs, tree.bmax.xs);
-        let near_ys = near(origins.ys, inverse_dirs.ys, tree.bmax.ys);
-        let near_zs = near(origins.zs, inverse_dirs.zs, tree.bmax.zs);
-
-        let last_xs = near_xs.is_greater_or_equal(near_ys) & near_xs.is_greater_or_equal(near_zs);
-        let last_ys = near_ys.is_greater_or_equal(near_zs) & last_xs.not();
-        let last_zs = (last_xs | last_ys).not();
+        let last_x = near[0].is_greater_or_equal(near[1]) & near[0].is_greater_or_equal(near[2]);
+        let last_y = near[1].is_greater_or_equal(near[2]) & last_x.not();
+        let last_z = (last_x | last_y).not();
 
         /*
             the ray position is tracked as integer voxel coords (0..2047)
@@ -283,8 +273,8 @@ impl PacketWalk {
         let vpm = SimdF32::from_float(VOXELS_PER_METER);
         let max_voxel = SimdI32::from(Tree64::VOXELS_PER_AXIS - 1);
 
-        let voxel_origins = origins.scale(vpm);
-        let voxel_dirs = directions.scale(vpm);
+        let voxel_origins = origins.scale(vpm).axes();
+        let voxel_dirs = directions.scale(vpm).axes();
 
         /* ENTRY VOXEL */
 
@@ -302,24 +292,18 @@ impl PacketWalk {
             cone,
             ts,
             max_ts,
-            xs: entry(voxel_dirs.xs, voxel_origins.xs),
-            ys: entry(voxel_dirs.ys, voxel_origins.ys),
-            zs: entry(voxel_dirs.zs, voxel_origins.zs),
+            voxels: per_axis(|a| entry(voxel_dirs[a], voxel_origins[a])),
             depths: SimdI32::ZEROES,
             shifts: [Tree64::CELL_SHIFT[0] as i32; 4],
             reaches: [0; 4],
             node_stack: [[0; Tree64::VOXEL_DEPTH + 1]; 4],
-            pos_xs: directions.xs.is_greater_or_equal(SimdF32::ZEROES),
-            pos_ys: directions.ys.is_greater_or_equal(SimdF32::ZEROES),
-            pos_zs: directions.zs.is_greater_or_equal(SimdF32::ZEROES),
-            last_xs,
-            last_ys,
-            last_zs,
+            pos: per_axis(|a| directions.axes()[a].is_greater_or_equal(SimdF32::ZEROES)),
+            last: [last_x, last_y, last_z],
             voxel_origins,
             voxel_dirs,
             // boundary distance = (voxel - voxel_origin) * (VOXEL_SIZE * inv_dir)
             // the subtraction is exact near the origin, rays starting on a boundary tie exactly
-            scaled_invs: inverse_dirs.scale(SimdF32::from_float(VOXEL_SIZE)),
+            scaled_invs: inverse_dirs.scale(SimdF32::from_float(VOXEL_SIZE)).axes(),
         }
     }
 
@@ -333,9 +317,7 @@ impl PacketWalk {
 
         let water_hits = if SKIP_WATER { 0 } else { u64::MAX };
 
-        let x_array = self.xs.to_array();
-        let y_array = self.ys.to_array();
-        let z_array = self.zs.to_array();
+        let [x_array, y_array, z_array] = per_axis(|a| self.voxels[a].to_array());
         let t_array = self.ts.to_array();
         let mut depth_array = self.depths.to_array();
         let mut active_array = self.active.to_array();
@@ -395,8 +377,7 @@ impl PacketWalk {
                     let blocks =
                         unsafe { tree.leaf_blocks.get_unchecked(node) }[SKIP_WATER as usize];
 
-                    // the ray is as wide as a whole 4x4x4 group of blocks by now, //
-                    // so any block in it makes the group solid (or the empty group gets hopped)
+                    // the ray covers a whole 4x4x4 group of blocks by now, so any block makes it solid //
 
                     if lod >= 2 {
                         let base = block & 0b101010;
@@ -425,11 +406,7 @@ impl PacketWalk {
                     if lod >= 1 {
                         if !ANY_HIT {
                             let summary = unsafe { tree.leaf_block_materials.get_unchecked(node) };
-                            let nibble = (summary[block as usize] >> (4 * SKIP_WATER as u8)) & 15;
-
-                            // SAFETY: the build only ever writes Material values in here
-                            self.materials[i] =
-                                unsafe { std::mem::transmute::<u8, Material>(nibble) };
+                            self.materials[i] = block_material(summary, block as usize, SKIP_WATER);
                         }
 
                         break true;
@@ -511,7 +488,7 @@ impl PacketWalk {
 
                 let child = branch.child_pointer + (branch.children & (bit - 1)).count_ones();
 
-                // the ray is a whole meter wide by now, a leaf with anything in it is one solid cell //
+                // the ray is a whole meter wide by now, any non empty leaf is one solid cell //
                 // (a water only leaf is nothing to a ray looking through water, it gets stepped)
 
                 if !ANY_HIT && depth == Tree64::LEAF_DEPTH - 1 && lod >= 3 {
@@ -580,8 +557,7 @@ impl PacketWalk {
 
     #[inline(always)]
     fn step(&mut self) {
-        let (xs, ys, zs) = (self.xs, self.ys, self.zs);
-        let (pos_xs, pos_ys, pos_zs) = (self.pos_xs, self.pos_ys, self.pos_zs);
+        let voxels = self.voxels;
 
         // box bounds in voxels, the far face is the one the ray exits through //
         // either the lane's own cell, or the empty cube around its meter. a cube can poke
@@ -592,90 +568,47 @@ impl PacketWalk {
         let cubes = reaches.reinterpret_as_u32().not_zero();
         let cube_sizes = reaches + reaches + SimdI32::from(8);
 
-        let lo = [xs, ys, zs]
-            .map(|c| SimdI32::select(cubes, (c & SimdI32::from(!7)) - reaches, c & sizes.neg()));
+        let lo = per_axis(|a| {
+            let c = voxels[a];
+            SimdI32::select(cubes, (c & SimdI32::from(!7)) - reaches, c & sizes.neg())
+        });
         let sizes = SimdI32::select(cubes, cube_sizes, sizes);
-        let hi = lo.map(|l| l + sizes - SimdI32::ONES);
+        let hi = per_axis(|a| lo[a] + sizes - SimdI32::ONES);
 
-        let far = |lo: SimdI32, hi: SimdI32, pos: SimdU32, origin: SimdF32, scaled_inv: SimdF32| {
-            (SimdI32::select(pos, hi + SimdI32::ONES, lo).to_f32() - origin) * scaled_inv
-        };
+        let tmax = per_axis(|a| {
+            let face = SimdI32::select(self.pos[a], hi[a] + SimdI32::ONES, lo[a]);
+            (face.to_f32() - self.voxel_origins[a]) * self.scaled_invs[a]
+        });
 
-        let tmax_xs = far(
-            lo[0],
-            hi[0],
-            pos_xs,
-            self.voxel_origins.xs,
-            self.scaled_invs.xs,
-        );
-        let tmax_ys = far(
-            lo[1],
-            hi[1],
-            pos_ys,
-            self.voxel_origins.ys,
-            self.scaled_invs.ys,
-        );
-        let tmax_zs = far(
-            lo[2],
-            hi[2],
-            pos_zs,
-            self.voxel_origins.zs,
-            self.scaled_invs.zs,
-        );
-
-        let t_exit = tmax_xs.min(tmax_ys.min(tmax_zs));
+        let t_exit = tmax[0].min(tmax[1].min(tmax[2]));
 
         // only one axis crosses per step (x > y > z on exact ties),
         // the tied axis crosses on the next step at the same distance,
         // so rays through exact edges / corners never slip between voxels
 
-        let mask_xs = tmax_xs.is_eq_to(t_exit);
-        let mask_ys = tmax_ys.is_eq_to(t_exit) & mask_xs.not();
-        let mask_zs = (mask_xs | mask_ys).not();
+        let mask_x = tmax[0].is_eq_to(t_exit);
+        let mask_y = tmax[1].is_eq_to(t_exit) & mask_x.not();
+        let masks = [mask_x, mask_y, (mask_x | mask_y).not()];
 
         // crossed axes land on the first voxel past the box,
         // the other axes are clamped into the box at the exit point
 
-        let next =
-            |mask: SimdU32, pos: SimdU32, lo: SimdI32, hi: SimdI32, d: SimdF32, o: SimdF32| {
-                SimdI32::select(
-                    mask,
-                    SimdI32::select(pos, hi + SimdI32::ONES, lo - SimdI32::ONES),
-                    d.mul_then_add(t_exit, o).floor_to_i32().clamp_to(lo, hi),
-                )
-            };
+        let next = per_axis(|a| {
+            let past = SimdI32::select(self.pos[a], hi[a] + SimdI32::ONES, lo[a] - SimdI32::ONES);
+            let inside = self.voxel_dirs[a]
+                .mul_then_add(t_exit, self.voxel_origins[a])
+                .floor_to_i32()
+                .clamp_to(lo[a], hi[a]);
 
-        let next_xs = next(
-            mask_xs,
-            pos_xs,
-            lo[0],
-            hi[0],
-            self.voxel_dirs.xs,
-            self.voxel_origins.xs,
-        );
-        let next_ys = next(
-            mask_ys,
-            pos_ys,
-            lo[1],
-            hi[1],
-            self.voxel_dirs.ys,
-            self.voxel_origins.ys,
-        );
-        let next_zs = next(
-            mask_zs,
-            pos_zs,
-            lo[2],
-            hi[2],
-            self.voxel_dirs.zs,
-            self.voxel_origins.zs,
-        );
+            SimdI32::select(masks[a], past, inside)
+        });
 
         /* ASCEND */
 
         // any bit above 2047 (or a negative coord) means the ray left the root, //
         // past max_ts the ray is done as well
 
-        let outside = (next_xs | next_ys | next_zs) & SimdI32::from(!(Tree64::VOXELS_PER_AXIS - 1));
+        let outside = (next[0] | next[1] | next[2]) & SimdI32::from(!(Tree64::VOXELS_PER_AXIS - 1));
 
         self.active = self.active
             & outside.reinterpret_as_u32().not_zero().not()
@@ -688,7 +621,7 @@ impl PacketWalk {
             which is (leading_zeros - 21) / 2, stack entries above it stay valid
         */
 
-        let changed = next_xs.xor(xs) | next_ys.xor(ys) | next_zs.xor(zs);
+        let changed = next[0].xor(voxels[0]) | next[1].xor(voxels[1]) | next[2].xor(voxels[2]);
 
         let pop_depths = (changed
             .reinterpret_as_u32()
@@ -701,14 +634,8 @@ impl PacketWalk {
 
         // remember the crossed axis of lanes that are still moving, it is the hit normal //
 
-        self.last_xs = SimdU32::select_bits(self.active, mask_xs, self.last_xs);
-        self.last_ys = SimdU32::select_bits(self.active, mask_ys, self.last_ys);
-        self.last_zs = SimdU32::select_bits(self.active, mask_zs, self.last_zs);
-
-        self.xs = next_xs;
-        self.ys = next_ys;
-        self.zs = next_zs;
-
+        self.last = per_axis(|a| SimdU32::select_bits(self.active, masks[a], self.last[a]));
+        self.voxels = next;
         self.ts = t_exit;
     }
 
@@ -717,25 +644,25 @@ impl PacketWalk {
     fn finish(self) -> PacketHit {
         let hit = SimdU32::from(self.hit_flags);
 
-        let normal = |positive: SimdU32, last: SimdU32| {
-            SimdF32::select(
-                last & hit,
-                SimdF32::select(positive, SimdF32::NEGS, SimdF32::ONES),
-                SimdF32::ZEROES,
-            )
-        };
+        let normals = per_axis(|a| {
+            let away = SimdF32::select(self.pos[a], SimdF32::NEGS, SimdF32::ONES);
+            SimdF32::select(self.last[a] & hit, away, SimdF32::ZEROES)
+        });
 
         PacketHit {
             hit,
             distances: SimdF32::from(self.distances),
-            normals: Packed_Vec3_x4 {
-                xs: normal(self.pos_xs, self.last_xs),
-                ys: normal(self.pos_ys, self.last_ys),
-                zs: normal(self.pos_zs, self.last_zs),
-            },
+            normals: Packed_Vec3_x4::from_axes(normals),
             materials: self.materials,
         }
     }
+}
+
+/// [f(0), f(1), f(2)], spelled out because [0, 1, 2].map pushed the simd values
+/// out of registers and cost the traversal ~10%
+#[inline(always)]
+fn per_axis<T>(mut f: impl FnMut(usize) -> T) -> [T; 3] {
+    [f(0), f(1), f(2)]
 }
 
 /// all 8 cells of a 2x2x2 group at the low corner of a 4x4x4 node, shifted by
@@ -752,8 +679,7 @@ fn lod_shift(footprint: f32) -> i32 {
     ((footprint.to_bits() >> 23) & 0xFF) as i32 - 127
 }
 
-/// how a lumped bunch of blocks looks from afar: the summary material of its highest block.
-/// blocks = some of one leaf's block bits (never 0), summary = that leaf's leaf_block_materials
+/// how a lumped bunch of blocks looks from afar: the summary material of its highest block
 #[inline(always)]
 fn top_material(blocks: u64, summary: &[u8; 64], skip_water: bool) -> Material {
     // the 16 blocks of one y layer, block index = x | (y << 2) | (z << 4) //
@@ -765,6 +691,12 @@ fn top_material(blocks: u64, summary: &[u8; 64], skip_water: bool) -> Material {
     }
 
     let block = (blocks & (LAYER << (4 * y))).trailing_zeros() as usize;
+    block_material(summary, block, skip_water)
+}
+
+/// summary material of one 2x2x2 block, the water skipping one is the high nibble
+#[inline(always)]
+fn block_material(summary: &[u8; 64], block: usize, skip_water: bool) -> Material {
     let nibble = (summary[block] >> (4 * skip_water as u8)) & 15;
 
     // SAFETY: the build only ever writes Material values in here
@@ -788,8 +720,7 @@ pub struct Branch {
     /// children are contiguous, offset = popcount(children & cells before)
     pub child_pointer: u32,
 
-    /// unused, it's just the 4 bytes that round the node up to 32, spelled out
-    /// so there's no hidden padding when the world cache writes branches out raw
+    /// unused, spells out the padding so the world cache can write branches raw
     pub spare: u32,
 }
 
@@ -1211,8 +1142,6 @@ mod tests {
             Material::Water,
         ];
 
-        // surface spots under random rays, plus deep inside solid stone and up in the open sky //
-
         let mut brushes = Vec::new();
 
         for _ in 0..600 {
@@ -1238,8 +1167,6 @@ mod tests {
 
         brushes.push((Vec3::new(1024.0, 16.0, 1024.0), 8, Material::Air));
         brushes.push((Vec3::new(800.0, 1840.0, 800.0), 4, Material::Wood));
-
-        // every voxel around each brush ends up exactly how the brush says //
 
         let mut rays = test_rays();
 
@@ -1280,8 +1207,7 @@ mod tests {
             }
 
             // rays straight at the edit, from above, sideways and from its center. //
-            // directions stay off the lattice, the center is a voxel center / corner
-            // and an exact tie there can go either (valid) way
+            // an exact tie at the center can go either (valid) way
 
             let m = center * VOXEL_SIZE;
             let dirs = [
@@ -1295,8 +1221,6 @@ mod tests {
             rays.push((m, dirs[2].normalize()));
         }
 
-        // the sky ball sticks out above the old terrain top, rays still find it //
-
         let packet = Packet::from_vecs(
             [Vec3::new(100.06, 250.0, 100.06); 4],
             [Vec3::new(0.0, -1.0, 0.0); 4],
@@ -1304,8 +1228,6 @@ mod tests {
         let hit = primary(&world.tree, packet);
         assert_eq!(hit.materials[0], Material::Wood);
         assert!((hit.distances.to_array()[0] - 19.75).abs() < 1e-3);
-
-        // the traversal (leaf summaries, skip map, top bound) agrees with the plain walk //
 
         let mismatches = compare::<false, false>(&world.tree, &rays)
             + compare::<false, true>(&world.tree, &rays)
@@ -1538,6 +1460,55 @@ mod tests {
                 })
                 .collect();
             write_ppm(&format!("view{index}"), width, height, &rgb);
+        }
+    }
+
+    /// dev only: moving frame times (ms) at 720p, the perf gate
+    /// cargo test --release bench_views -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_views() {
+        let (width, height) = (1280, 720);
+        let mut engine = crate::engine::Engine::new(width, height, World::new());
+        let mut buffer = vec![0u32; width * height];
+
+        engine.fps_target = 2;
+
+        let views = [
+            (
+                Vec3::new(128.0, 160.0, -20.0),
+                Vec3::new(128.0, 90.0, 128.0),
+            ),
+            (Vec3::new(40.0, 90.0, 40.0), Vec3::new(140.0, 70.0, 140.0)),
+            (
+                Vec3::new(250.0, 120.0, 250.0),
+                Vec3::new(150.0, 60.0, 150.0),
+            ),
+            (Vec3::new(95.0, 92.0, 96.0), Vec3::new(88.0, 62.0, 150.0)),
+        ];
+
+        for (index, (position, target)) in views.into_iter().enumerate() {
+            engine.camera.center = position;
+            engine.camera.look_at(target);
+
+            let mut times: Vec<f64> = (0..45)
+                .map(|_| {
+                    engine.frame_accumulation_count = 0;
+                    let start = std::time::Instant::now();
+                    engine.render(buffer.as_mut_ptr() as usize);
+                    start.elapsed().as_secs_f64() * 1000.0
+                })
+                .skip(5)
+                .collect();
+            times.sort_by(f64::total_cmp);
+
+            // the min is the steady one, a laptop's median wanders with its temperature //
+            println!(
+                "view {index}: min {:.2}ms  median {:.2}ms  p90 {:.2}ms",
+                times[0],
+                times[times.len() / 2],
+                times[times.len() * 9 / 10]
+            );
         }
     }
 }

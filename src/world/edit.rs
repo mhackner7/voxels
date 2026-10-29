@@ -5,42 +5,24 @@ use crate::world::leaf::{Brick, Leaf};
 use crate::world::tree64::{Branch, Tree64};
 use crate::world::voxel::*;
 
-/*
-    EDITING
-
-    the tree is packed for tracing, every branch's children sit side by side so a child
-    is found with a popcount. so giving a branch a new child means moving the whole family:
-    the siblings get copied to the end of the pool with the new one slotted in, and the old
-    spot is just left behind (a few kb, never reused for now). a family that's already at
-    the end of the pool (like one that just got moved) grows right where it is
-
-    uniform cells (solid / water) get split open into a child that's just as uniform,
-    all the way down to a leaf, then the voxel gets flipped inside the leaf
-
-    after that the leaf summaries get redone and the skip map shrinks around anything new.
-    removing stuff never grows the skip map back, a distance that's too small is still
-    correct, rays just take a few more steps than they need to there
-*/
+// a new child copies its whole sibling family to the end of the pool, unless it's already there
+// the skip map only ever shrinks, a distance that's too small is still correct
 
 /// what the crosshair is on
 #[derive(Clone, Copy, Debug)]
 pub struct Target {
-    /// the voxel that got hit (voxel coords)
     pub voxel: [i32; 3],
-    /// face it got hit on, the empty voxel in front of it is voxel + normal.
-    /// all zero when the ray started inside the voxel
+    /// the empty voxel in front is voxel + normal, all zero when the ray started inside
     pub normal: [i32; 3],
-    /// where the ray hit, in voxel space
     pub point: Vec3,
     pub material: Material,
 }
 
 impl World {
-    /// biggest brush, the sphere is this many voxels across (1m)
+    /// biggest brush diameter in voxels (1m)
     pub const BRUSH_MAX: u32 = 8;
 
-    /// first voxel along a ray (meters) that isn't water, within reach meters.
-    /// plain voxel by voxel dda, a few hundred point queries at most
+    /// first non water voxel along a ray within reach (meters), plain voxel dda
     pub fn raycast(&self, origin: Vec3, dir: Vec3, reach: f32) -> Option<Target> {
         let o = origin * VOXELS_PER_METER;
         let mut voxel = [0, 1, 2].map(|a| o[a].floor() as i32);
@@ -93,9 +75,7 @@ impl World {
         None
     }
 
-    /// center of a brush of diameter voxels on the target (voxel space).
-    /// placing sits the sphere right on the face, breaking sinks it in just as deep,
-    /// so a 1 voxel brush is exactly the voxel in front of / behind the face
+    /// brush center on the target (voxel space), placing sits on the face, breaking sinks in as deep
     pub fn brush_center(target: &Target, diameter: u32, place: bool) -> Vec3 {
         let half = diameter as f32 * 0.5;
         let side = if place { 1.0 } else { -1.0 };
@@ -105,7 +85,6 @@ impl World {
             let n = target.normal[a];
 
             center[a] = if n != 0 {
-                // the face plane, then out / in along the normal //
                 let face = (target.voxel[a] + (n > 0) as i32) as f32;
                 face + n as f32 * side * half
             } else if diameter & 1 == 1 {
@@ -120,7 +99,7 @@ impl World {
         center
     }
 
-    /// does the voxel sit inside a brush (voxel space center), a voxel counts by its center
+    /// a voxel counts by its center
     #[inline(always)]
     pub fn in_brush(voxel: [i32; 3], center: Vec3, diameter: u32) -> bool {
         let half = diameter as f32 * 0.5;
@@ -133,14 +112,8 @@ impl World {
         offset.length_squared() <= half * half + 1e-3
     }
 
-    /*
-        fill or carve a sphere of diameter voxels (1..=BRUSH_MAX) at center (voxel space)
-
-        material Air carves: everything that isn't water goes, and the hole floods
-        if it's open to water (from above or the side, never upwards)
-        anything else fills: only air and water get replaced, keep_out (meters, the player)
-        never gets filled. returns whether anything changed
-    */
+    // Air carves (the hole floods from water above or beside), anything else fills air and water
+    // but never keep_out (the player). returns whether anything changed
     pub fn edit(
         &mut self,
         center: Vec3,
@@ -156,7 +129,6 @@ impl World {
 
         let keep_out = keep_out.map(|(lo, hi)| (lo * VOXELS_PER_METER, hi * VOXELS_PER_METER));
 
-        // every voxel that changed, BRUSH_MAX^3 at most //
         let mut changed =
             [[0i32; 3]; (Self::BRUSH_MAX * Self::BRUSH_MAX * Self::BRUSH_MAX) as usize];
         let mut count = 0;
@@ -238,8 +210,6 @@ impl World {
             self.tree.refresh_leaf(leaf);
         }
 
-        // new stuff shrinks the skip map around it and might poke out the top //
-
         if !carve {
             let (mut lo, mut hi) = ([usize::MAX; 3], [0; 3]);
 
@@ -257,7 +227,6 @@ impl World {
         true
     }
 
-    /// one voxel, the leaf it landed in gets its summary redone once the edit moves on from it
     fn set(&mut self, [x, y, z]: [i32; 3], material: Material, pending: &mut Option<usize>) {
         let leaf = self
             .tree
@@ -272,8 +241,7 @@ impl World {
 }
 
 impl Tree64 {
-    /// set one voxel (voxel coords, inside the volume), Air clears it.
-    /// returns the leaf it's in now, its summary still needs a refresh_leaf
+    /// set one voxel, Air clears it. returns its leaf, which still needs a refresh_leaf
     pub fn set_voxel(&mut self, [x, y, z]: [u32; 3], material: Material) -> usize {
         let leaf = self.open_leaf([x, y, z]);
         let voxel = ((x & 7) | ((y & 7) << 3) | ((z & 7) << 6)) as usize;
@@ -289,7 +257,7 @@ impl Tree64 {
         leaf
     }
 
-    /// index of the leaf holding a voxel, cells on the way down get opened up if they have to
+    /// leaf holding a voxel, opening up cells on the way down
     fn open_leaf(&mut self, [x, y, z]: [u32; 3]) -> usize {
         let mut node = 0usize;
 
@@ -309,8 +277,7 @@ impl Tree64 {
         node
     }
 
-    /// give the branch at node (depth) a child at the cell bit, just as full as the cell was:
-    /// solid, water or empty. at LEAF_DEPTH - 1 that child is a leaf
+    /// give a branch a child at the cell bit, just as full as the cell was
     fn adopt(&mut self, node: usize, depth: usize, bit: u64) {
         let mut branch = self.branches[node];
 
@@ -344,8 +311,7 @@ impl Tree64 {
         self.branches[node] = branch;
     }
 
-    /// same as adopt but for a family of leaves, which lives in 4 pools at once.
-    /// returns where the family lives now
+    /// adopt for a family of leaves (4 pools at once), returns where it lives now
     fn adopt_leaf(&mut self, start: usize, count: usize, rank: usize, fill: Material) -> u32 {
         let full = if fill == Material::Air { 0 } else { u64::MAX };
         let leaf = Leaf { voxels: [full; 8] };
@@ -358,8 +324,6 @@ impl Tree64 {
         insert(&mut self.leaf_blocks, start, count, rank, [0; 2]);
         insert(&mut self.leaf_block_materials, start, count, rank, [0; 64]);
 
-        // summaries (and water bits) of the whole family, they might have moved //
-
         self.water_leaves.resize(self.leaves.len().div_ceil(64), 0);
 
         for leaf in moved as usize..=moved as usize + count {
@@ -369,9 +333,7 @@ impl Tree64 {
         moved
     }
 
-    /// the meters lo..=hi got something in them, every meter within SKIP_MAX of them
-    /// is at most its chebyshev distance to that box now. dry = not just water,
-    /// so the map that ignores water shrinks too
+    /// meters lo..=hi got filled, shrink the skip map around them (dry = the water ignoring one too)
     pub fn shrink_skip(&mut self, lo: [usize; 3], hi: [usize; 3], dry: bool) {
         let reach = Self::SKIP_MAX as usize;
         let last = Self::METERS_PER_AXIS - 1;
@@ -383,7 +345,6 @@ impl Tree64 {
                 for x in around(0) {
                     let meter = [x, y, z];
 
-                    // gap to the box along each axis, 0 inside it //
                     let gap = (0..3)
                         .map(|a| {
                             lo[a]
@@ -404,7 +365,6 @@ impl Tree64 {
         }
     }
 
-    /// something got built up to top (voxels), rays have to look at least that high now
     pub fn raise_top(&mut self, top: u32) {
         let top = (top as f32 * VOXEL_SIZE).min(Self::WIDTH);
 
@@ -414,9 +374,8 @@ impl Tree64 {
     }
 }
 
-/// slot item in at rank of the family pool[start..start + count],
-/// returns where the family starts now. a family at the very end of the pool
-/// grows right there, anything else gets copied to the end first
+/// slot item into the family at rank, returns its new start.
+/// a family at the end of the pool grows in place, anything else moves to the end first
 fn insert<T: Copy>(pool: &mut Vec<T>, start: usize, count: usize, rank: usize, item: T) -> u32 {
     let start = if start + count == pool.len() {
         start

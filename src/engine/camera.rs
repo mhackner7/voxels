@@ -64,15 +64,14 @@ impl Camera {
         };
 
         cam.update();
-
-        return cam;
+        cam
     }
 
     pub fn update(&mut self) {
         const UP_CLAMP: f32 = f32::to_radians(89.99);
         const DOWN_CLAMP: f32 = f32::to_radians(-89.99);
 
-        self.pitch = self.pitch.max(DOWN_CLAMP).min(UP_CLAMP);
+        self.pitch = self.pitch.clamp(DOWN_CLAMP, UP_CLAMP);
 
         self.front = Vec3::new(
             self.yaw.sin() * self.pitch.cos(),

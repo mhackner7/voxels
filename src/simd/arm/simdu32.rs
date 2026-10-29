@@ -50,11 +50,6 @@ impl SimdU32 {
     pub fn shll<const SHAMT: i32>(self) -> Self {
         unsafe { vshlq_n_u32::<SHAMT>(self.data).into() }
     }
-    /// logical left shift based on variable
-    #[inline(always)]
-    pub fn shllv(self, shift: Self) -> Self {
-        unsafe { vshlq_u32(self.data, vreinterpretq_s32_u32(shift.data)).into() }
-    }
     /// logical and
     #[inline(always)]
     pub fn and(self, other: Self) -> Self {
@@ -81,28 +76,6 @@ impl SimdU32 {
     pub fn to_f32_unit(self) -> SimdF32 {
         const INV_2_24: f32 = 1.0 / 16_777_216.0;
         unsafe { vmulq_n_f32(vcvtq_f32_u32(vshrq_n_u32::<8>(self.data)), INV_2_24).into() }
-    }
-
-    /// greater than or equal
-    #[inline(always)]
-    pub fn great_or_eq(self, other: Self) -> Self {
-        unsafe { vcgeq_u32(self.data, other.data).into() }
-    }
-
-    /// not equal
-    #[inline(always)]
-    pub fn not_eq(self, other: Self) -> Self {
-        unsafe { vmvnq_u32(vceqq_u32(self.data, other.data)).into() }
-    }
-
-    #[inline(always)]
-    pub fn all_equal(self) -> bool {
-        unsafe {
-            let all_set = vdupq_n_u32(vgetq_lane_u32::<0>(self.data));
-            let mask = vceqq_u32(all_set, self.data);
-            let min = vminvq_u32(mask);
-            min != 0
-        }
     }
 
     /// number of leading zero bits per lane
@@ -154,11 +127,6 @@ impl SimdU32 {
     #[inline(always)]
     pub fn has_active(self) -> bool {
         unsafe { vmaxvq_u32(self.data) != 0 }
-    }
-
-    #[inline(always)]
-    pub fn has_all_active(self) -> bool {
-        unsafe { vminvq_u32(self.data) == u32::MAX }
     }
 }
 

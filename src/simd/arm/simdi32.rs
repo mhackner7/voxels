@@ -12,7 +12,6 @@ pub struct SimdI32 {
 
 impl SimdI32 {
     pub const ZEROES: Self = unsafe { std::mem::transmute([0; 4]) };
-    pub const FOURS: Self = unsafe { std::mem::transmute([4; 4]) };
     pub const ONES: Self = unsafe { std::mem::transmute([1; 4]) };
 
     #[inline(always)]
@@ -42,10 +41,6 @@ impl SimdI32 {
         self.max(min).min(max)
     }
     #[inline(always)]
-    pub fn reinterpret_as_f32(self) -> SimdF32 {
-        unsafe { vreinterpretq_f32_s32(self.data).into() }
-    }
-    #[inline(always)]
     pub fn reinterpret_as_u32(self) -> SimdU32 {
         unsafe { vreinterpretq_u32_s32(self.data).into() }
     }
@@ -71,15 +66,6 @@ impl SimdI32 {
         unsafe { vshlq_s32(self.data, shift.data).into() }
     }
 
-    #[inline(always)]
-    pub fn great_or_eq(self, other: Self) -> SimdU32 {
-        unsafe { vcgeq_s32(self.data, other.data).into() }
-    }
-
-    #[inline(always)]
-    pub fn less_than(self, other: Self) -> SimdU32 {
-        unsafe { vcltq_s32(self.data, other.data).into() }
-    }
     #[inline(always)]
     pub fn sub(self, other: Self) -> Self {
         unsafe { vsubq_s32(self.data, other.data).into() }
@@ -107,17 +93,6 @@ impl SimdI32 {
     #[inline(always)]
     pub fn xor(self, other: Self) -> Self {
         unsafe { veorq_s32(self.data, other.data).into() }
-    }
-
-    #[inline(always)]
-    pub fn outside_range(self, min: Self, max: Self) -> SimdU32 {
-        unsafe {
-            vorrq_u32(
-                vcltq_s32(self.data, min.data),
-                vcgtq_s32(self.data, max.data),
-            )
-            .into()
-        }
     }
 }
 

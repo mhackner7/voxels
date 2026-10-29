@@ -21,9 +21,6 @@ impl SimdF32 {
     /// four 1.0s
     pub const ONES: Self = unsafe { std::mem::transmute([1.0f32; 4]) };
 
-    /// four 2.0s
-    pub const TWOS: Self = unsafe { std::mem::transmute([2.0f32; 4]) };
-
     /// four -1.0s
     pub const NEGS: Self = unsafe { std::mem::transmute([-1.0f32; 4]) };
 
@@ -46,23 +43,6 @@ impl SimdF32 {
             vst1q_f32(a.as_mut_ptr(), self.data);
             a
         }
-    }
-
-    #[inline(always)]
-    pub fn div(self, other: Self) -> Self {
-        unsafe { vdivq_f32(self.data, other.data).into() }
-    }
-
-    #[inline(always)]
-    /// a + (b * c) -> add + (mul1 * mul2)
-    pub fn mul_add(add: Self, mul1: Self, mul2: Self) -> Self {
-        unsafe { vfmaq_f32(add.data, mul1.data, mul2.data).into() }
-    }
-
-    #[inline(always)]
-    /// a + (b * c) -> self + (mul1 * mul2)
-    pub fn add_to_mul(self, mul1: Self, mul2: Self) -> Self {
-        unsafe { vfmaq_f32(self.data, mul1.data, mul2.data).into() }
     }
 
     #[inline(always)]
@@ -109,10 +89,6 @@ impl SimdF32 {
     pub fn is_eq_to(self, other: Self) -> SimdU32 {
         unsafe { vceqq_f32(self.data, other.data).into() }
     }
-    #[inline(always)]
-    pub fn is_ne_to(self, other: Self) -> SimdU32 {
-        self.is_eq_to(other).not()
-    }
 
     #[inline(always)]
     pub fn is_less_than(self, other: Self) -> SimdU32 {
@@ -144,11 +120,6 @@ impl SimdF32 {
         unsafe { vreinterpretq_u32_f32(self.data).into() }
     }
 
-    #[inline(always)]
-    pub fn to_i32(self) -> SimdI32 {
-        unsafe { vcvtq_s32_f32(self.data).into() }
-    }
-
     /// floor and convert in one instruction
     #[inline(always)]
     pub fn floor_to_i32(self) -> SimdI32 {
@@ -168,11 +139,6 @@ impl SimdF32 {
     #[inline(always)]
     pub fn clamp_to(self, min: Self, max: Self) -> Self {
         self.max(min).min(max)
-    }
-
-    #[inline(always)]
-    pub fn squared(self) -> Self {
-        self * self
     }
 
     #[inline(always)]

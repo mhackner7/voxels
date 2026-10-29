@@ -9,6 +9,7 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::engine::Engine;
+use crate::engine::input::Action;
 use crate::world::World;
 
 pub struct App<'a> {
@@ -17,12 +18,7 @@ pub struct App<'a> {
     /// window size, logical before the window exists, physical after
     width: usize,
     height: usize,
-    engine: Engine, // scale_factor: u32,
-                    // camera: Camera,
-                    // raytracer : RayTracer,
-                    // world : World,
-                    // user_info : Info,
-                    // cursor : Cursor,
+    engine: Engine,
 }
 
 impl App<'_> {
@@ -70,10 +66,6 @@ impl App<'_> {
         self.width = width as usize;
         self.height = height as usize;
     }
-
-    fn shutdown(&mut self) {
-        eprintln!("Window Closing");
-    }
 }
 
 impl ApplicationHandler for App<'_> {
@@ -90,7 +82,6 @@ impl ApplicationHandler for App<'_> {
             .with_decorations(true)
             .with_visible(true);
 
-        println!("[App] Creating window ({}x{})...", self.width, self.height);
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
         let _ = window
@@ -100,10 +91,6 @@ impl ApplicationHandler for App<'_> {
 
         let surface_size = window.inner_size();
         let (render_width, render_height) = (self.engine.render_width, self.engine.render_height);
-        println!(
-            "[App] Allocating Pixels texture buffer (render: {}x{}, surface: {}x{})...",
-            render_width, render_height, surface_size.width, surface_size.height
-        );
 
         let surface_texture =
             SurfaceTexture::new(surface_size.width, surface_size.height, window.clone());
@@ -119,7 +106,6 @@ impl ApplicationHandler for App<'_> {
 
         self.resize_window_to(surface_size);
 
-        println!("[App] Graphics pipeline ready. Starting first frame render request.");
         self.window.as_ref().unwrap().request_redraw();
     }
 
@@ -134,7 +120,6 @@ impl ApplicationHandler for App<'_> {
                 self.resize_window_to(new_size);
             }
             WindowEvent::CloseRequested => {
-                self.shutdown();
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -166,45 +151,37 @@ impl ApplicationHandler for App<'_> {
 
                 self.window.as_ref().unwrap().request_redraw();
             }
-            WindowEvent::KeyboardInput {
-                device_id: _,
-                event,
-                is_synthetic: _,
-            } => match event.physical_key {
-                PhysicalKey::Code(keycode) => {
-                    self.engine.input.push(keycode.into(), event.state.into())
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key) = event.physical_key
+                    && let Some(action) = Action::from_key(key)
+                {
+                    self.engine.input.set(action, event.state.is_pressed());
                 }
-                _ => (),
-            },
-            WindowEvent::MouseInput {
-                device_id: _,
-                state,
-                button,
-            } => self.engine.input.push(button.into(), state.into()),
-            WindowEvent::MouseWheel {
-                device_id: _,
-                delta,
-                phase: _,
-            } => {
-                // trackpads send zero deltas when a scroll ends, those would count as up //
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(action) = Action::from_button(button) {
+                    self.engine.input.set(action, state.is_pressed());
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // trackpads send zero deltas when a scroll ends, those would count as down //
 
-                let still = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y == 0.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y == 0.0,
+                let y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
 
-                if !still {
-                    self.engine
-                        .input
-                        .push(delta.into(), crate::engine::input::util::State::Pressed);
+                if y != 0.0 {
+                    let action = if y > 0.0 {
+                        Action::BrushGrow
+                    } else {
+                        Action::BrushShrink
+                    };
+                    self.engine.input.tap(action);
                 }
             }
             _ => (),
         }
-    }
-
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        eprintln!("Goodbye!");
     }
 
     fn device_event(
@@ -214,7 +191,7 @@ impl ApplicationHandler for App<'_> {
         event: winit::event::DeviceEvent,
     ) {
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.engine.input.last_mouse_motion = delta;
+            self.engine.input.mouse_motion = delta;
         }
     }
 }

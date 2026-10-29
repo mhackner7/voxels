@@ -1,19 +1,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::*};
 
-/*
-    FACE LIGHT CACHE
-
-    the light landing on every voxel face that's been on screen, kept in world space,
-    so moving the camera never throws it away. every pixel looking at a face just reads
-    its light, only one lane a frame (the first one to ask) ever shades it.
-    far away faces get lumped into 2x2 / 4x4 / 8x8 voxel patches (the level),
-    so a patch still covers a couple pixels and shading it is worth it
-
-    it's one flat open addressing table that never grows, a full probe run kicks out
-    whatever face went the longest without being looked at. every frame touches it
-    from every thread at once: only the lane that claimed a face writes it that frame,
-    everyone else just reads, so plain relaxed atomics are enough (no locks)
-*/
+// face light cache: light per voxel face in world space, so moving the camera keeps it.
+// only the lane that claims a face writes it that frame, so relaxed atomics are enough (no locks)
 
 /// one face, 32 bytes
 #[repr(C, align(32))]
@@ -24,51 +12,43 @@ struct Slot {
     light: [AtomicU32; 3],
     /// generation << 16 | samples, an old generation counts as empty
     state: AtomicU32,
-    /// last frame anything looked at the face
     stamp: AtomicU32,
 }
 
-/// what a lane gets told to do about its face
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
-    /// shade it, it lives in slot and has samples so far (0 = brand new)
+    /// shade it, samples so far (0 = brand new)
     Shade { slot: u32, samples: u32 },
     /// it already has light (or will by the time this tile reads it)
     Lit,
-    /// brand new and another tile is shading it right now, so there's nothing to read yet
+    /// brand new and another tile is shading it, nothing to read yet
     Missing,
 }
 
 pub struct LightCache {
     slots: Vec<Slot>,
-    /// slots.len() - 1
     mask: usize,
     /// 64 - log2(slots.len()), the hash keeps its top bits
     shift: u32,
-    /// clear() bumps it, slots of older ones read as empty (16 bits)
+    /// bumped by clear(), older generations read as empty (16 bits)
     generation: u32,
 
-    /// faces that have ever moved into an empty slot
     pub used: AtomicU32,
-    /// face samples shaded since the last take_lit()
     pub lit: AtomicU32,
 }
 
 impl LightCache {
-    /// how many slots (2^21 faces, 64MB)
+    /// 2^21 faces, 64MB
     pub const SLOTS: usize = 1 << 21;
 
-    /// slots looked at past where a key lands before giving up and evicting
     const PROBES: usize = 8;
 
-    /// faces under this many samples get shaded every frame no matter the budget
+    /// under this many samples a face gets shaded every frame
     pub const YOUNG: u32 = 8;
 
-    /// a face's mean stops counting up here, after that new samples just fade in
-    /// (that's how edits and moving shadows get picked up eventually)
+    /// a face's mean stops counting here, new samples just fade in (picks up edits and moving shadows)
     pub const SAMPLES: u32 = 128;
 
-    /// converged faces get shaded this many times less often than the budget says
     pub const SETTLED: u32 = 16;
 
     pub fn new(slots: usize) -> Self {
@@ -91,8 +71,7 @@ impl LightCache {
         }
     }
 
-    /// key of a face patch: voxel coords (0..2047), face (axis * 2 + positive) and
-    /// level, the patch is 2^level voxels wide so the voxel coords lose level bits
+    /// voxel coords (0..2047) >> level, face = axis * 2 + positive, patch is 2^level voxels wide
     #[inline(always)]
     pub fn key(voxel: [u32; 3], face: u8, level: u32) -> u64 {
         let [x, y, z] = voxel.map(|c| (c >> level) as u64);
@@ -105,7 +84,6 @@ impl LightCache {
         (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
     }
 
-    /// samples a slot holds for the current generation
     #[inline(always)]
     fn samples(&self, slot: &Slot) -> u32 {
         let state = slot.state.load(Relaxed);
@@ -117,7 +95,7 @@ impl LightCache {
         }
     }
 
-    /// mean light of a face and how many samples that is, None = no light yet
+    /// None = no light yet
     #[inline(always)]
     pub fn lookup(&self, key: u64) -> Option<([f32; 3], u32)> {
         let home = self.home(key);
@@ -149,12 +127,7 @@ impl LightCache {
         None
     }
 
-    /*
-        a lane looking at a face asks whether it should shade it this frame.
-        the first lane of the frame to ask decides, everyone after just reads:
-        young faces always get shaded, the rest when their turn comes around
-        (every `every` frames, SETTLED times less once they've converged)
-    */
+    // first lane of the frame to ask decides, young faces always get shaded, the rest when their turn comes
     #[inline(always)]
     pub fn claim(&self, key: u64, frame: u32, every: u32) -> Claim {
         let home = self.home(key);
@@ -170,8 +143,6 @@ impl LightCache {
             }
 
             if found == 0 {
-                // empty slot, it's ours unless someone beat us to it //
-
                 match slot.key.compare_exchange(0, key, AcqRel, Acquire) {
                     Ok(_) => {
                         self.used.fetch_add(1, Relaxed);
@@ -191,8 +162,7 @@ impl LightCache {
             }
         }
 
-        // a full run, kick out whatever went unseen the longest //
-        // (never something that got looked at this frame, it's on screen)
+        // full run, kick out the stalest face (never one seen this frame) //
 
         let (age, index, old) = stalest;
 
@@ -214,7 +184,6 @@ impl LightCache {
         }
     }
 
-    /// a slot that just got a new face
     #[inline(always)]
     fn reset(&self, index: usize, frame: u32) -> Claim {
         let slot = &self.slots[index];
@@ -250,7 +219,6 @@ impl LightCache {
             every * Self::SETTLED
         };
 
-        // spread the turns out over frames so it's not every face at once //
         let turn = ((key ^ (key >> 29)) as u32).wrapping_add(frame);
 
         if turn.is_multiple_of(period) {
@@ -263,7 +231,7 @@ impl LightCache {
         }
     }
 
-    /// one more light sample into a claimed slot (only the claimer ever calls this)
+    /// only the claimer ever calls this
     #[inline(always)]
     pub fn add(&self, slot: u32, light: [f32; 3]) {
         let slot = &self.slots[slot as usize];
@@ -284,7 +252,7 @@ impl LightCache {
         self.lit.fetch_add(1, Relaxed);
     }
 
-    /// forget every face (the sun moved, the lighting changed), costs nothing
+    /// forget every face, costs nothing (just a generation bump)
     pub fn clear(&mut self) {
         self.generation = (self.generation + 1) & 0xFFFF;
 
@@ -299,12 +267,7 @@ impl LightCache {
         }
     }
 
-    /*
-        something got built or broken, so the faces around lo..hi (voxels, inclusive)
-        go back to being young: they keep their old light as a single sample and get
-        shaded every frame till the new light takes over. every level gets it,
-        a far patch overlapping the box is just as stale
-    */
+    // faces around lo..hi (voxels, inclusive) go back to young, old light kept as one sample
     pub fn invalidate(&self, lo: [i32; 3], hi: [i32; 3]) {
         for level in 0..4 {
             let [x0, y0, z0] = lo.map(|c| (c.clamp(0, 2047) as u32) >> level);
@@ -323,7 +286,6 @@ impl LightCache {
         }
     }
 
-    /// drop a face down to one sample, if it's in here at all
     #[inline(always)]
     fn forget(&self, key: u64) {
         let home = self.home(key);
@@ -345,7 +307,6 @@ impl LightCache {
         }
     }
 
-    /// face samples shaded since the last call, for the perf overlay
     pub fn take_lit(&self) -> u32 {
         self.lit.swap(0, Relaxed)
     }
@@ -383,15 +344,11 @@ mod tests {
         assert_eq!(cache.lookup(key), Some(([2.0, 2.0, 2.0], 2)));
         assert_eq!(cache.claim(key, 2, 1), Claim::Lit);
 
-        // a patch key covers all the voxels in it //
-
         assert_eq!(
             LightCache::key([96, 200, 300], 3, 3),
             LightCache::key([103, 207, 303], 3, 3)
         );
         assert_ne!(LightCache::key([96, 200, 300], 3, 3), key);
-
-        // converged faces only come around every so often //
 
         for _ in 0..LightCache::SAMPLES {
             cache.add(slot, [2.0; 3]);
@@ -401,8 +358,6 @@ mod tests {
             .filter(|&frame| matches!(cache.claim(key, frame, 4), Claim::Shade { .. }))
             .count();
         assert_eq!(shaded, 64 / (4 * LightCache::SETTLED) as usize);
-
-        // invalidating around it makes it young again, light kept as one sample //
 
         cache.invalidate([90, 190, 290], [110, 210, 310]);
         assert_eq!(cache.lookup(key).map(|l| l.1), Some(1));
@@ -416,13 +371,9 @@ mod tests {
         cache.invalidate([90, 190, 290], [110, 210, 310]);
         assert_eq!(cache.lookup(far).map(|l| l.1), Some(2));
 
-        // clear forgets everything //
-
         cache.clear();
         assert_eq!(cache.lookup(key), None);
         assert_eq!(cache.lookup(far), None);
-
-        // a full table evicts the stalest face, never one seen this frame //
 
         let mut small = LightCache::new(8);
 

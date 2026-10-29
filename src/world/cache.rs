@@ -6,22 +6,13 @@ use crate::world::tree64::Tree64;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-/*
-    WORLD CACHE
-
-    generating the world takes a couple seconds, loading it back takes a fraction of that.
-    the file is just every pool of the tree dumped as raw bytes behind a small header,
-    they're all plain #[repr(C)] data so there's nothing to convert either way
-
-    the header carries a hash of the generator's own source, so changing the terrain
-    (or the tree layout) makes old caches stale on their own, no stale worlds sneaking in.
-    only the freshly generated world is ever cached, edits never get written back
-*/
+// world cache: every pool dumped raw behind a small header. the header carries a hash of the
+// generator's source, so changing terrain code makes old caches stale. edits never get saved
 
 /// whether to use the cached world when there is one
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reuse {
-    /// ask in the terminal (just reuse it when there's no terminal to ask in)
+    /// ask in the terminal (no terminal means reuse)
     Ask,
     Yes,
     No,
@@ -32,8 +23,7 @@ const MAGIC: [u8; 4] = *b"VOXW";
 /// bump whenever the file layout itself changes
 const FORMAT: u64 = 1;
 
-/// fingerprint of everything that decides what a world looks like and how it's laid out,
-/// a cache only counts when the exact same code wrote it
+/// hash of the code that decides what a world looks like and how it's laid out
 pub const SOURCE_HASH: u64 = {
     let mut hash = fnv(0xcbf2_9ce4_8422_2325 ^ FORMAT, include_bytes!("terrain.rs"));
     hash = fnv(hash, include_bytes!("build.rs"));
@@ -58,13 +48,11 @@ const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
 const HEADER: usize = 4 + 8 + 8 + 7 * 8 + 4;
 
 impl World {
-    /// where the world for a seed gets cached
     pub fn cache_path(seed: u64) -> PathBuf {
         PathBuf::from(format!("cache/world_{seed}.bin"))
     }
 
-    /// the cached world for seed if there is one (and reuse says so), otherwise a freshly
-    /// generated one that gets cached for next time
+    /// cached world for seed if there is one (and reuse says so), else build and cache a new one
     pub fn load_or_build(seed: u64, reuse: Reuse) -> Self {
         let path = Self::cache_path(seed);
         let start = std::time::Instant::now();
@@ -115,7 +103,7 @@ impl World {
     }
 }
 
-/// asks in the terminal, enter / y means yes. nobody to ask means yes too
+/// enter / y means yes, no terminal means yes too
 fn ask_reuse(seed: u64, path: &Path) -> bool {
     if !std::io::stdin().is_terminal() {
         return true;
@@ -132,8 +120,7 @@ fn ask_reuse(seed: u64, path: &Path) -> bool {
 }
 
 impl Tree64 {
-    /// write every pool behind the header, through a temp file so a half written
-    /// cache never takes the real one's place
+    /// goes through a temp file so a half written cache never replaces the real one
     pub fn save(&self, path: &Path, seed: u64) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -166,7 +153,7 @@ impl Tree64 {
         std::fs::rename(temp, path)
     }
 
-    /// read a cache back, Ok(None) = it's from another seed or another version of the code
+    /// Ok(None) = another seed or another version of the code
     pub fn load(path: &Path, seed: u64) -> std::io::Result<Option<Self>> {
         let mut file = std::fs::File::open(path)?;
         let mut header = [0u8; HEADER];
@@ -181,8 +168,7 @@ impl Tree64 {
         let lens: [usize; 7] = std::array::from_fn(|i| word(2 + i) as usize);
         let top = f32::from_le_bytes(header[HEADER - 4..].try_into().unwrap());
 
-        // the file has to be exactly as long as the header says, so a cut off cache //
-        // never gets half read (and a garbage length never gets allocated)
+        // file length has to match the header, so a cut off cache never gets half read //
 
         let sizes = Self::pool_sizes();
         let body: u64 = (0..7).map(|i| (lens[i] * sizes[i]) as u64).sum();
@@ -206,7 +192,6 @@ impl Tree64 {
         Ok(Some(tree))
     }
 
-    /// pool lengths, in file order
     fn pool_lens(&self) -> [usize; 7] {
         [
             self.branches.len(),
@@ -219,7 +204,6 @@ impl Tree64 {
         ]
     }
 
-    /// bytes per element of every pool, in file order
     fn pool_sizes() -> [usize; 7] {
         [
             size_of::<crate::world::tree64::Branch>(),
@@ -233,13 +217,11 @@ impl Tree64 {
     }
 }
 
-/// a pool as raw bytes
 fn bytes<T: Copy>(pool: &[T]) -> &[u8] {
     // SAFETY: every pool is #[repr(C)] plain data (ints and arrays of them), no padding
     unsafe { std::slice::from_raw_parts(pool.as_ptr() as *const u8, size_of_val(pool)) }
 }
 
-/// a pool of len elements straight from the file into its own memory
 fn read<T: Copy>(file: &mut std::fs::File, len: usize) -> std::io::Result<Vec<T>> {
     let mut pool = Vec::<T>::with_capacity(len);
 
@@ -268,8 +250,6 @@ mod tests {
 
         tree.save(&path, 1337).unwrap();
 
-        // everything comes back exactly //
-
         let loaded = Tree64::load(&path, 1337)
             .unwrap()
             .expect("same seed and code");
@@ -289,8 +269,6 @@ mod tests {
             let [x, y, z] = [i * 7919 % 2048, i * 104_729 % 1024, i * 1_299_709 % 2048];
             assert_eq!(loaded.voxel_at(x, y, z), tree.voxel_at(x, y, z));
         }
-
-        // another seed, other code or a cut off file don't count //
 
         assert!(Tree64::load(&path, 42).unwrap().is_none());
 

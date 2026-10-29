@@ -1,5 +1,5 @@
 use super::*;
-use crate::engine::input::commands::*;
+use crate::engine::input::Action;
 use crate::simd::packetray::Packet;
 use crate::simd::packetvec::Packed_Vec3_x4;
 use crate::simd::simdf32::SimdF32;
@@ -23,7 +23,6 @@ use std::fmt::Write;
 pub const FRAME_HISTORY: usize = 120;
 
 pub struct Ui {
-    /// crosshair, the brush preview and what's in hand, on unless the menu is open
     pub hud: bool,
     /// 1: where you are, where you're looking, what you're looking at
     pub overlay: bool,
@@ -243,17 +242,16 @@ impl Lines {
 impl Engine {
     /// ui toggles and dev menu navigation, runs once the input got processed
     pub fn ui_input(&mut self) {
-        let activity = &self.input.activity;
-        let pressed = |cmd: Command| activity.was_pressed(cmd);
+        let pressed = |action| self.input.was_pressed(action);
 
-        let overlay = pressed(DeveloperCommands::ShowDebugInfoLight.into());
-        let perf = pressed(DeveloperCommands::ShowDebugInfoHeavy.into());
-        let menu = pressed(DeveloperCommands::OpenDevMenu.into());
-        let back = pressed(DeveloperCommands::Back.into());
-        let up = pressed(PlayerCommands::MoveForward.into());
-        let down = pressed(PlayerCommands::MoveBackward.into());
-        let left = pressed(PlayerCommands::MoveLeft.into());
-        let right = pressed(PlayerCommands::MoveRight.into());
+        let overlay = pressed(Action::Overlay);
+        let perf = pressed(Action::Perf);
+        let menu = pressed(Action::Menu);
+        let back = pressed(Action::Escape);
+        let up = pressed(Action::Forward);
+        let down = pressed(Action::Back);
+        let left = pressed(Action::Left);
+        let right = pressed(Action::Right);
 
         self.ui.overlay ^= overlay;
         self.ui.perf ^= perf;
@@ -387,13 +385,12 @@ impl Engine {
             }
 
             let player = &self.player;
-            let state = &player.state;
 
             lines.push(
                 WHITE,
                 format_args!(
-                    "{} {:?} {:?} {:?}  HAND {:?}",
-                    player.name, state.y_state, state.gait, state.medium, player.hand
+                    "{:?} {:?} {:?}  HAND {:?}",
+                    player.y_state, player.gait, player.medium, player.hand
                 ),
             );
             lines.push(
@@ -576,8 +573,7 @@ impl Engine {
 }
 
 impl Engine {
-    /// lighten every pixel whose voxel a break would take, so the brush size shows right
-    /// on the ground. the pixel's voxel comes back out of its depth and face, no tracing
+    /// lighten every pixel a break would take, so the brush size shows on the ground
     fn draw_brush(&self, pixels: &mut [u32]) {
         let Some(target) = self.target else {
             return;
@@ -601,8 +597,7 @@ impl Engine {
                         continue;
                     }
 
-                    // a ray is one unit along front per unit of depth, so depth scales it //
-                    // right onto the face, then half a voxel back in lands inside the voxel
+                    // depth scales the ray right onto the face, half a voxel back lands inside the voxel //
 
                     let ray = row_ray + camera.pixel_delta_x * x as f32;
                     let mut p =
@@ -614,7 +609,6 @@ impl Engine {
                     let voxel = [0, 1, 2].map(|a| p[a].floor() as i32);
 
                     if World::in_brush(voxel, center, brush) {
-                        // 30% of the way to white //
                         let [r, g, b, _] = pixel.to_le_bytes();
                         let lift = |c: u8| c + (((255 - c) as u32 * 77) >> 8) as u8;
                         *pixel = u32::from_le_bytes([lift(r), lift(g), lift(b), 255]);

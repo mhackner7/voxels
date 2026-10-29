@@ -1,21 +1,19 @@
 use crate::math::vec3::Vec3;
 use crate::world::World;
 use crate::world::voxel::{Material, VOXEL_SIZE};
-use winit::keyboard::SmolStr;
 
 pub struct Player {
-    pub name: SmolStr,
-    pub state: PlayerState,
+    pub gait: GaitState,
+    pub y_state: VerticalState,
+    pub medium: MediumState,
     /// eye position in meters, the camera just sits here
     pub position: Vec3,
     /// meters per second, only y is simulated (gravity / jumps),
     /// x and z come straight from the keys every frame
     pub velocity: Vec3,
-    /// what gets placed (right click), middle click picks up whatever you're looking at
     pub hand: Material,
-    /// brush diameter in voxels (1..=World::BRUSH_MAX), scroll grows / shrinks it
+    /// brush diameter in voxels (1..=World::BRUSH_MAX)
     pub brush: u32,
-    /// seconds until a held mouse button edits again
     pub edit_cooldown: f32,
 
     /// flying straight through walls
@@ -26,16 +24,6 @@ pub struct Player {
     pub fly_boost: f32,
     /// seconds since space was last tapped, for the double tap
     pub since_jump: f32,
-}
-
-pub struct PlayerState {
-    pub gait: GaitState,
-    pub y_state: VerticalState,
-    /// frames in a row spent off the ground
-    pub air_time: u32,
-    /// frames in a row spent sprinting
-    pub run_time: u32,
-    pub medium: MediumState,
 }
 
 /// what movement action is the player currently doing
@@ -82,7 +70,6 @@ impl Player {
     pub const FLY_RAMP: f32 = 0.8;
     pub const FLY_BOOST_MAX: f32 = 16.0;
 
-    /// what the arrows cycle through
     pub const HAND: [Material; 7] = [
         Material::Stone,
         Material::Dirt,
@@ -96,7 +83,6 @@ impl Player {
     /// how far away you can break / place stuff (meters)
     pub const REACH: f32 = 16.0;
 
-    /// seconds between edits while a mouse button is held
     pub const EDIT_REPEAT: f32 = 0.15;
 
     /// walking physics (m/s^2, m/s), a jump clears about 1.2m
@@ -109,16 +95,11 @@ impl Player {
     pub const SWIM_SPEED: f32 = 2.0;
 
     /// starts out flying at position (meters)
-    pub fn new(name: &str, position: Vec3) -> Self {
+    pub fn new(position: Vec3) -> Self {
         Self {
-            name: name.into(),
-            state: PlayerState {
-                gait: GaitState::Still,
-                y_state: VerticalState::Flying,
-                air_time: 0,
-                run_time: 0,
-                medium: MediumState::Air,
-            },
+            gait: GaitState::Still,
+            y_state: VerticalState::Flying,
+            medium: MediumState::Air,
             position,
             velocity: Vec3::DEFAULT,
             hand: Material::Stone,
@@ -133,7 +114,7 @@ impl Player {
 
     #[inline(always)]
     pub fn flying(&self) -> bool {
-        self.state.y_state == VerticalState::Flying
+        self.y_state == VerticalState::Flying
     }
 
     /// double tapping space flips between flying and walking,
@@ -152,7 +133,7 @@ impl Player {
 
         // second tap, so switch modes and don't jump on top of it //
 
-        self.state.y_state = if self.flying() {
+        self.y_state = if self.flying() {
             VerticalState::Falling
         } else {
             VerticalState::Flying
@@ -176,8 +157,8 @@ impl Player {
     ) {
         let chest = self.position - Vec3::new(0.0, Self::CHEST, 0.0);
 
-        self.state.gait = gait;
-        self.state.medium = if world.water_at(chest) {
+        self.gait = gait;
+        self.medium = if world.water_at(chest) {
             MediumState::Water
         } else {
             MediumState::Air
@@ -188,20 +169,6 @@ impl Player {
         } else {
             self.walk(world, wish, dt, jump, swim);
         }
-
-        // streak counters //
-
-        self.state.run_time = if gait == GaitState::Sprinting {
-            self.state.run_time + 1
-        } else {
-            0
-        };
-
-        self.state.air_time = if self.state.y_state == VerticalState::Grounded {
-            0
-        } else {
-            self.state.air_time + 1
-        };
     }
 
     /// flying: the key move as is, just sped up the longer it's held
@@ -225,14 +192,14 @@ impl Player {
     fn walk(&mut self, world: &World, wish: Vec3, dt: f32, jump: bool, swim: bool) {
         self.fly_boost = 1.0;
 
-        let vy = if self.state.medium == MediumState::Water {
+        let vy = if self.medium == MediumState::Water {
             if swim {
                 Self::SWIM_SPEED
             } else {
                 (self.velocity[1] - Self::GRAVITY * Self::WATER_GRAVITY * dt).max(-Self::SWIM_SPEED)
             }
         } else {
-            let vy = if jump && self.state.y_state == VerticalState::Grounded {
+            let vy = if jump && self.y_state == VerticalState::Grounded {
                 Self::JUMP_SPEED
             } else {
                 self.velocity[1]
@@ -256,7 +223,7 @@ impl Player {
 
         self.velocity[1] = if landed || bumped { 0.0 } else { vy };
 
-        self.state.y_state = if landed {
+        self.y_state = if landed {
             VerticalState::Grounded
         } else if self.velocity[1] > 0.0 {
             VerticalState::Rising
@@ -327,7 +294,7 @@ mod tests {
 
     /// a player dropped onto the ground column at (x, z) meters
     fn standing(world: &World, x: f32, z: f32) -> Player {
-        let mut player = Player::new("test", Vec3::new(x, 200.0, z));
+        let mut player = Player::new(Vec3::new(x, 200.0, z));
         player.move_by(world, Vec3::new(0.0, -199.0, 0.0));
         player
     }
@@ -383,7 +350,7 @@ mod tests {
 
         // a double tap turns flying off, then the player drops and lands //
 
-        let mut player = Player::new("test", Vec3::new(130.0, 150.0, 120.0));
+        let mut player = Player::new(Vec3::new(130.0, 150.0, 120.0));
         assert!(player.tap_jump(dt, true));
         assert!(!player.tap_jump(dt, true));
         assert!(!player.flying());
@@ -392,7 +359,7 @@ mod tests {
             step(&mut player, false);
         }
 
-        assert_eq!(player.state.y_state, VerticalState::Grounded);
+        assert_eq!(player.y_state, VerticalState::Grounded);
         let ground = player.position[1];
 
         // standing still really is still, no creeping //
@@ -414,7 +381,7 @@ mod tests {
             "jump peak {}",
             peak - ground
         );
-        assert_eq!(player.state.y_state, VerticalState::Grounded);
+        assert_eq!(player.y_state, VerticalState::Grounded);
         assert!((player.position[1] - ground).abs() < 1e-4);
     }
 }
